@@ -843,8 +843,10 @@ class RLTrainer:
         checkpoint_states = ray.get(self.trainer_actor.load_checkpoint_states_or_default.remote())
         ray.get(self.trainer_actor.restore_best_metric_tracker.remote(checkpoint_states))
 
-        start_episode = checkpoint_states["episode"]
-        global_step = checkpoint_states["global_step"]
+        # .get with defaults: an interrupted save can leave model/ without extra_state.pt, so
+        # load_ckpt returns states={} (weights load, scalars empty) — resume at 0, not KeyError.
+        start_episode = checkpoint_states.get("episode", 0)
+        global_step = checkpoint_states.get("global_step", 0)
         total_consumed_prompts = checkpoint_states.get("total_consumed_prompts", 0)
         if global_step > 0:
             ray.get(

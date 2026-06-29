@@ -288,7 +288,12 @@ class SamplesGenerator:
             # -> NCCL collective desync/hang. Drop+backfill the whole group so each accepted group
             # contributes exactly n_samples (batch stays a clean groups_per_batch * n_samples).
             n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
-            if len(group_samples) < n_samples:
+            # Count ROLLOUTS, not step-samples: a multi-turn / context-compacting agent emits
+            # several step-samples per rollout sharing one rollout_id (see experience.py), so
+            # len(group_samples) over-counts and a group that actually lost a rollout could still
+            # pass this completeness check. Count distinct rollout_ids (single-turn: 1 each, == old).
+            n_rollouts = len({(s.rollout_ids[0] if getattr(s, "rollout_ids", None) else id(s)) for s in group_samples})
+            if n_rollouts < n_samples:
                 drop_counts["incomplete_group"] += len(group_samples)
                 return []
             if not self._passes_dynamic_filter(group_samples):

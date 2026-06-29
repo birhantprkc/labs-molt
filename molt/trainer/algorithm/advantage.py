@@ -219,6 +219,8 @@ def rloo(
         group_rewards = rewards[group]
         if len(group) > 1:
             advantages[group] = group_rewards - (group_rewards.sum() - group_rewards) / (len(group) - 1)
+        # singleton group: no leave-one-out baseline exists, so the advantage stays the raw
+        # reward (REINFORCE without baseline) — intentional, not zeroed.
     returns = broadcast_advantages(advantages, ctx)
     return [ret.clone() for ret in returns], returns
 

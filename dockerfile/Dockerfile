@@ -173,6 +173,17 @@ RUN python -m pip install ftfy open_clip_torch timm wcwidth && \
     python -c "import importlib.util as u; assert u.find_spec('fla.ops.cp') and u.find_spec('fla.modules.convolution') and u.find_spec('fla.ops.gated_delta_rule'), 'fla CP ops missing'" && \
     rm -f /tmp/requirements.txt /tmp/req.filtered.txt
 
+# --- restore DeepEP's NVSHMEM ABI ----------------------------------------------
+# DeepEP (step c) built deep_ep_cpp.so against nvidia-nvshmem-cu13==3.6.5, but vLLM hard-pins
+# ==3.4.5, so its install above DOWNGRADED the wheel -> deep_ep_cpp.so then fails to load with
+# `undefined symbol: nvshmem_selected_device_transport, version NVSHMEM`. Force nvshmem back to
+# 3.6.5 as the LAST pip action (a backward-compatible superset: it keeps 3.4.5's symbols for
+# vLLM while restoring the newer one DeepEP needs). --no-deps so pip does NOT re-drag vLLM's
+# ==3.4.5 pin, and re-create the unversioned .so symlink the DeepEP step made.
+RUN python -m pip install --no-deps --force-reinstall nvidia-nvshmem-cu13==3.6.5 && \
+    NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | awk '/^Location:/{print $2}')/nvidia/nvshmem/lib && \
+    ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so
+
 # Register torch's bundled nvidia libs on the loader path (vLLM pulls nvidia-* wheels).
 RUN find ${SITE}/nvidia -mindepth 2 -maxdepth 2 -type d -name lib | sort \
         > /etc/ld.so.conf.d/python-nvidia-libs.conf && ldconfig

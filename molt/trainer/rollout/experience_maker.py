@@ -117,7 +117,7 @@ class RemoteExperienceMaker:
 
         args = self.args
         cp_tp_copies = get_model_parallel_size(args)
-        dummy_ref = ray.put([[None]] * (len(samples_list) * cp_tp_copies))
+        n_samples = len(samples_list)
 
         # Extract tensors for batch processing
         sequences_list = [s.sequences for s in samples_list]
@@ -141,30 +141,31 @@ class RemoteExperienceMaker:
         colocated_policy_workers = getattr(args.train, "colocate_fsdp_models", False) and (
             self.initial_model_group is not None or self.critic_model_group is not None
         )
-        # Actor model (receives mm_train_inputs_list for VLM). R3: the old-logprob
-        # recompute must replay the rollout's routing too, so old/new logprobs differ
-        # only by the weight update (not by routing drift) and vllm_kl actually drops.
-        # Only the actor replays — the reference/critic are different policies.
-        actor_forward_kwargs = dict(vlm_forward_kwargs)
-        if any(s.routed_experts is not None for s in samples_list):
-            # async_run_method_batch fans this list out one-per-sample, like
-            # mm_train_inputs_list, so each forward gets its own (1, L, K, T) tensor.
-            actor_forward_kwargs["routed_experts"] = [s.routed_experts for s in samples_list]
-        action_log_probs_ref = self._dispatch_forward(
-            self.actor_model_group,
-            colocated_policy_workers,
-            **actor_forward_kwargs,
-        )
+        # On-policy with no KL (kl_coef == 0): old == the training forward, so the PPO
+        # ratio is 1 and the loss is REINFORCE — the old-logprob recompute is redundant.
+        # Skip it; policy_train sets old = action.detach(), sharing the exact R3 routing.
+        # (A KL/distill reward, kl_coef > 0, still needs old to compare against the ref.)
+        skip_actor_old = args.train.force_on_policy and args.algo.kl.init_coef == 0
+        if not skip_actor_old:
+            actor_forward_kwargs = dict(vlm_forward_kwargs)
+            if any(s.routed_experts is not None for s in samples_list):
+                # R3: replay the rollout routing so old picks the same experts as training.
+                actor_forward_kwargs["routed_experts"] = [s.routed_experts for s in samples_list]
+            action_log_probs_ref = self._dispatch_forward(
+                self.actor_model_group,
+                colocated_policy_workers,
+                **actor_forward_kwargs,
+            )
 
-        # Reference model (also receives mm_train_inputs_list for VLM)
+        # Reference model (also receives mm_train_inputs_list for VLM). If there is no
+        # reference, base log-probs stay None (filled below).
+        base_action_log_probs_ref = None
         if self.initial_model_group is not None:
             base_action_log_probs_ref = self._dispatch_forward(
                 self.initial_model_group,
                 colocated_policy_workers,
                 **vlm_forward_kwargs,
             )
-        else:
-            base_action_log_probs_ref = dummy_ref
 
         # Critic value model (PPO/gae only). Its own Ray group; CriticModelActor.forward
         # returns the per-token V(s) on the action span — same dispatch shape as the ref.
@@ -177,12 +178,25 @@ class RemoteExperienceMaker:
             else None
         )
 
-        # Gather ray refs and flatten, dropping the duplicate CP/TP rank copies.
-        action_log_probs_list = list(itertools.chain.from_iterable(ray.get(action_log_probs_ref)[::cp_tp_copies]))
-        base_action_log_probs_list = list(
-            itertools.chain.from_iterable(ray.get(base_action_log_probs_ref)[::cp_tp_copies])
-        )
-        values_list = list(itertools.chain.from_iterable(ray.get(values_ref)[::cp_tp_copies])) if use_critic else None
+        # Gather each forward's per-sample results, dropping the duplicate CP/TP rank
+        # copies. A forward we didn't run (skipped actor / no reference / no critic)
+        # yields a per-sample None list.
+        if skip_actor_old:
+            action_log_probs_list = [None] * n_samples
+        else:
+            action_log_probs_list = list(itertools.chain.from_iterable(ray.get(action_log_probs_ref)[::cp_tp_copies]))
+
+        if base_action_log_probs_ref is not None:
+            base_action_log_probs_list = list(
+                itertools.chain.from_iterable(ray.get(base_action_log_probs_ref)[::cp_tp_copies])
+            )
+        else:
+            base_action_log_probs_list = [None] * n_samples
+
+        if use_critic:
+            values_list = list(itertools.chain.from_iterable(ray.get(values_ref)[::cp_tp_copies]))
+        else:
+            values_list = None
 
         assert (
             len(samples_list) == len(action_log_probs_list) == len(base_action_log_probs_list)
@@ -195,7 +209,7 @@ class RemoteExperienceMaker:
         for i, (samples, action_log_probs, base_action_log_probs) in enumerate(
             zip(samples_list, action_log_probs_list, base_action_log_probs_list)
         ):
-            if (self.initial_model_group is not None) and (not args.algo.kl.use_loss):
+            if (self.initial_model_group is not None) and (not args.algo.kl.use_loss) and action_log_probs is not None:
                 kl = compute_approx_kl(
                     action_log_probs,
                     base_action_log_probs,
@@ -203,8 +217,10 @@ class RemoteExperienceMaker:
                 )
                 logprobs_diff = action_log_probs.float() - base_action_log_probs.float()
             else:
-                kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device="cpu")
-                logprobs_diff = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device="cpu")
+                # action_log_probs may be None (force_on_policy skipped the recompute),
+                # so size the zero KL / logprobs_diff from the always-present action mask.
+                kl = torch.zeros_like(samples.action_mask, dtype=torch.float32, device="cpu")
+                logprobs_diff = torch.zeros_like(samples.action_mask, dtype=torch.float32, device="cpu")
             kl_mean = masked_mean(kl, samples.action_mask, dim=-1)
             logprobs_diff_mean = masked_mean(logprobs_diff, samples.action_mask, dim=-1)
 

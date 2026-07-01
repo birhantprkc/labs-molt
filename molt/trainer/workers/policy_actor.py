@@ -16,11 +16,7 @@ from molt.models import Actor, PolicyLoss, agg_loss
 from molt.models.utils import compute_approx_kl, masked_mean, split_moe_aux_loss
 from molt.trainer.algorithm.experience import Experience, get_model_parallel_size
 from molt.trainer.fsdp import FsdpStrategy
-from molt.trainer.fsdp.refit import (
-    gather_full_param,
-    should_refit_state_dict_entry,
-    state_dict_parameter_trainability,
-)
+from molt.trainer.fsdp.refit import gather_full_param
 from molt.utils import get_tokenizer
 from molt.utils.distributed_util import stateless_init_process_group, torch_dist_barrier_and_cuda_sync
 from molt.utils.logging_utils import init_logger
@@ -367,6 +363,14 @@ class PolicyTrainer:
             **multimodal_inputs,
         )
         action_log_probs = model_output["action_log_probs"]
+        if old_action_log_probs is None:
+            # force_on_policy: experience_maker skipped the redundant old-logprob forward.
+            # The batch is trained for one on-policy step, so old == this forward -> PPO
+            # ratio 1 -> REINFORCE gradient; the IS correction still runs vs rollout_log_probs.
+            # Taking old FROM this forward also guarantees old and action share the exact
+            # R3-replayed routing (they are the same forward) — the importance ratio needs
+            # both log-probs computed under the rollout's expert selection.
+            old_action_log_probs = action_log_probs.detach()
 
         # Stage 3: compute policy loss and metric-only policy diagnostics.
         # reported_actor_loss is a plain per-token mean for logging, decoupled
@@ -525,7 +529,6 @@ class PolicyTrainer:
         from torch.distributed.tensor import DTensor
 
         ep_size = getattr(self.strategy.args.fsdp, "ep_size", 1) or 1
-        parameter_trainability = state_dict_parameter_trainability(model)
 
         # Pack many small per-tensor broadcasts into ~1 GiB batched broadcasts.
         # Inspired by vLLM's `vllm.distributed.weight_transfer.packed_tensor`
@@ -538,7 +541,11 @@ class PolicyTrainer:
         # still call `gather_full_param` (an FSDP collective) but drop the
         # gathered tensor immediately — no point staging ~1 GiB on every rank.
         is_rank0 = torch.distributed.get_rank() == 0
-        packed_threshold_bytes = 1 << 30  # 1 GiB
+        # 512 MiB flushes, matching slime's `--update-weight-buffer-size` default
+        # (512 * 1024**2). vLLM runs at high gpu_memory_utilization (~0.9-0.95) with
+        # little free VRAM, and the receiver allocates a contiguous
+        # `torch.empty(sum(sizes))` per flush — the old 1 GiB batch OOMed the engine.
+        packed_threshold_bytes = 512 * 1024**2  # 512 MiB (slime default)
 
         pending_metas: list[tuple[str, torch.dtype, tuple[int, ...]]] = []
         pending_tensors: list[torch.Tensor] = []
@@ -558,12 +565,19 @@ class PolicyTrainer:
             pending_bytes = 0
 
         for name, tensor in model.state_dict().items():
-            if not should_refit_state_dict_entry(
-                name,
-                tensor,
-                parameter_trainability,
-                is_vlm=getattr(self.actor, "is_vlm", False),
-            ):
+            # Refit EVERY state_dict entry (each converted to HF names below). vLLM's
+            # load_weights matches by name and ignores what it doesn't have, so the
+            # "which weights to accept" decision lives on the vLLM side. We deliberately
+            # do NOT pre-filter by a named_parameters requires_grad map: its FQNs differ
+            # from state_dict's (custom-AutoModel / FSDP naming), so that filter silently
+            # skipped ~all trained weights and left vLLM stuck on the base checkpoint
+            # (vllm_kl then grew with training as the actor drifted from the stale engine).
+            # Skip TE `_extra_state` (fp8 amax bookkeeping — a uint8 tensor in recent
+            # TE, a BytesIO in older) and any other non-tensor. It is never a real
+            # weight and vLLM has no param for it; the HF adapter drops it via
+            # `exclude_key_regex` anyway (NeMo-RL relies on that same regex). Skip it
+            # here so a tensor-valued `_extra_state` can't trip the expert guard below.
+            if not torch.is_tensor(tensor) or name.endswith("_extra_state"):
                 continue
 
             # EP-sharded experts must be DTensors so `gather_full_param`'s
@@ -617,11 +631,18 @@ class PolicyTrainer:
                     device=torch.device("cuda", torch.cuda.current_device()),
                     non_blocking=True,
                 ).contiguous()
+                nbytes = hf_weight.numel() * hf_weight.element_size()
+                # slime's `_chunk_by_size`: flush the accumulated batch BEFORE adding a
+                # weight that would take it to/over the buffer size, so each broadcast
+                # buffer stays bounded (an oversized lone tensor forms its own batch). The
+                # old post-append check let a big tensor land on an already-near-threshold
+                # batch, ballooning the receiver's contiguous buffer and OOM-ing vLLM. The
+                # trailing `_flush()` after the loop sends the final partial batch.
+                if pending_bytes and pending_bytes + nbytes >= packed_threshold_bytes:
+                    _flush()
                 pending_metas.append((hf_name, hf_weight.dtype, tuple(hf_weight.shape)))
                 pending_tensors.append(hf_weight)
-                pending_bytes += hf_weight.numel() * hf_weight.element_size()
-                if pending_bytes >= packed_threshold_bytes:
-                    _flush()
+                pending_bytes += nbytes
             del weight
 
         if is_rank0:

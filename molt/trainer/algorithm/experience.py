@@ -173,8 +173,9 @@ class Experience:
         # Merge all fields
         for name in field_names:
             values = [getattr(e, name) for e in experiences_list]
-            # Use pad_token_id for sequences field, 0 for others
-            pad_value = pad_token_id if name == "sequences" else 0
+            # sequences pad with pad_token_id; routed_experts with the R3 -1 sentinel
+            # ("keep live routing" — 0 is a valid expert id); everything else with 0.
+            pad_value = pad_token_id if name == "sequences" else (-1 if name == "routed_experts" else 0)
             result[name] = Experience._merge_item(values, pad_value)
 
         return Experience(**result)
@@ -231,7 +232,10 @@ def make_experience_batch(items: List[Experience]) -> Experience:
         elif isinstance(first, torch.Tensor):
             tensors = [getattr(item, f.name) for item in items]
             if Experience.is_step_tensor_field(f.name):
-                kwargs[f.name] = zero_pad_sequences(tensors, "right", stack=True)
+                # routed_experts pads with the R3 -1 sentinel (keep live routing); 0 is a
+                # valid expert id and would force pad tokens to expert 0. Others pad with 0.
+                pad_value = -1 if f.name == "routed_experts" else 0
+                kwargs[f.name] = zero_pad_sequences(tensors, "right", stack=True, value=pad_value)
             elif Experience.is_episode_tensor_field(f.name) or first.dim() == 0:
                 kwargs[f.name] = torch.stack(tensors)
             else:

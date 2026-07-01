@@ -37,7 +37,10 @@ def _classify_params(model: nn.Module, experts_to_muon: bool):
         if not param.requires_grad:
             continue
         module = named_modules.get(name.rsplit(".", 1)[0]) if "." in name else None
-        is_expert = type(module).__name__ in _EXPERT_MODULE_NAMES
+        # Match via the MRO: under multi-node EP, FSDP2 renames the experts module to a
+        # dynamic subclass (FSDPGroupedExperts*), so a plain __name__ check would miss it
+        # and drop the 3D expert weights back to AdamW. The original class stays in the MRO.
+        is_expert = any(base.__name__ in _EXPERT_MODULE_NAMES for base in type(module).__mro__)
 
         if isinstance(module, nn.Embedding):
             embed.append(param)

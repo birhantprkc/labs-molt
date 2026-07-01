@@ -49,5 +49,20 @@ class WorkerWrap:
         weights = [
             (name, part.view(dtype).view(*shape)) for (name, dtype, shape), part in zip(metas, buf.split(sizes))
         ]
-        self.model_runner.model.load_weights(weights=weights)
+        loaded = self.model_runner.model.load_weights(weights=weights)
+        # Warn on EVERY refit flush that vLLM ignored entirely (loaded nothing) -- a real
+        # name-format break silently drops those updates -> stale rollout weights.
+        # `load_weights` returns the set of *vLLM-internal* param names it assigned, which
+        # differ from the HF names we send (vLLM's WeightsMapper strips the outer `model.`
+        # prefix and fuses qkv/gate_up), so a per-name diff against our sent names would
+        # false-positive on every remapped/fused weight. Keying off "loaded 0 of N" avoids
+        # that: a healthy flush maps to >0 params; only a genuine mismatch maps to none.
+        # No other refit logging.
+        if loaded is not None and len(loaded) == 0 and weights:
+            print(
+                f"[refit] WARNING: vLLM loaded 0 of {len(weights)} refit weights in a flush "
+                f"(names unrecognized -> dropped, rollout stays stale); sample sent: "
+                f"{[name for name, _ in weights][:10]}",
+                flush=True,
+            )
         del buf

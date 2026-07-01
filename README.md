@@ -151,13 +151,29 @@ Read every line that touches your gradients, in plain PyTorch.
 
 ## 📦 Installation
 
-Use the project container for full-stack validation:
+The recommended path is the prebuilt project image on Docker Hub. It bakes the full
+CUDA-13 stack (torch 2.11 · vLLM · TransformerEngine · flash-attn · mamba · DeepEP ·
+NVIDIA AutoModel), so it runs SFT and RL as-is with no local build:
+
+```bash
+docker pull hijkzzz/molt:latest   # or the pinned tag hijkzzz/molt:0.1
+```
+
+`examples/scripts/docker_run.sh` defaults to this image (`IMAGE_NAME=hijkzzz/molt:latest`,
+build skipped), so a full-stack sanity check is one command:
 
 ```bash
 bash examples/scripts/docker_run.sh "python -c 'import vllm, transformer_engine; print(vllm.__version__); print(transformer_engine.__version__)'"
 ```
 
-For local development:
+To build the image yourself instead (e.g. to change the CUDA / vLLM pins), point the
+script at a local tag and enable the build:
+
+```bash
+IMAGE_NAME=molt:local SKIP_BUILD=0 bash examples/scripts/docker_run.sh "pytest -q"
+```
+
+For local (non-container) development:
 
 ```bash
 pip install -e ".[vllm]"
@@ -460,7 +476,7 @@ Notes:
   only the small MTP block stays at its checkpoint weights, so acceptance degrades
   gracefully rather than off a cliff.
 - **Model support is vLLM-side.** Qwen3.6-MoE works out of the box. The official
-  Nemotron-Nano-Omni HF checkpoint ships **no** MTP head, and vLLM 0.23 only
+  Nemotron-Nano-Omni HF checkpoint ships **no** MTP head, and vLLM 0.24 only
   auto-detects MTP for the *Super*-Omni arch (not Nano) — so omni3 rollout-MTP is
   unavailable until upstream adds it; vLLM errors at engine init if enabled on an
   unsupported checkpoint.

@@ -1,11 +1,13 @@
 set -ex
 
 PROJECT_PATH=$(cd $(dirname $0)/../../; pwd)
-IMAGE_NAME="${IMAGE_NAME:-molt-fsdp2:latest}"
+# Default to the prebuilt Docker Hub image; skip the (multi-hour) local build unless
+# the caller opts in with SKIP_BUILD=0 (typically alongside a local IMAGE_NAME).
+IMAGE_NAME="${IMAGE_NAME:-hijkzzz/molt:latest}"
 DOCKER_GPUS="${DOCKER_GPUS:-all}"
 DOCKER_SHM_SIZE="${DOCKER_SHM_SIZE:-10g}"
 
-if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
+if [[ "${SKIP_BUILD:-1}" != "1" ]]; then
 	docker build -t "$IMAGE_NAME" -f "$PROJECT_PATH/dockerfile/Dockerfile" "$PROJECT_PATH"
 fi
 

@@ -13,7 +13,7 @@ import torch
 
 from molt.agents.base import Trajectory
 from molt.models.base import BaseModel
-from molt.trainer.algorithm.experience import Experience, remove_padding_in_sequences
+from molt.trainer.algorithm.experience import Experience, make_experience_batch, remove_padding_in_sequences
 
 L, K = 3, 2  # MoE layers, top-k
 
@@ -96,6 +96,27 @@ def test_remove_padding_trims_routed_experts_on_seq_dim():
     assert exp.sequences.shape == (3,)
     assert exp.routed_experts.shape == (L, K, 3)  # seq (last) dim trimmed, L/K kept
     assert torch.equal(exp.routed_experts, routed[..., :3])
+
+
+def test_make_experience_batch_pads_routed_experts_with_sentinel():
+    # Batching samples of unequal length pads step tensors on the last (seq) dim.
+    # routed_experts must pad with the R3 -1 sentinel (keep live routing), NOT 0 —
+    # 0 is a valid expert id and would force the pad tokens to expert 0.
+    long = Experience(
+        sequences=torch.tensor([1, 2, 3]),
+        attention_mask=torch.tensor([1, 1, 1]),
+        routed_experts=torch.zeros(L, K, 3, dtype=torch.int16),
+    )
+    short = Experience(
+        sequences=torch.tensor([1, 2]),
+        attention_mask=torch.tensor([1, 1]),
+        routed_experts=torch.zeros(L, K, 2, dtype=torch.int16),
+    )
+    batch = make_experience_batch([long, short])
+
+    assert batch.routed_experts.shape == (2, L, K, 3)
+    assert (batch.routed_experts[1, :, :, 2] == -1).all()  # short sample's padded tail -> sentinel
+    assert batch.sequences[1, 2].item() == 0  # sequences still pad with 0
 
 
 def test_build_routing_targets_selects_sparse_hybrid_global_layer_ids():

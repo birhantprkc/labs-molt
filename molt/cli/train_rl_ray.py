@@ -89,6 +89,32 @@ def train(args):
     has_ref = args.algo.kl.init_coef > 0
     has_critic = args.algo.advantage.estimator == "gae"
     colocate_fsdp_models = args.train.colocate_fsdp_models and (has_ref or has_critic)
+
+    # Fail-fast on GPU over-subscription (covers BOTH paths). vLLM holds num_engines*TP GPUs.
+    # Colocated FSDP models time-slice ONE actor-sized group; otherwise the actor, ref and critic
+    # each claim their own GPUs. If the total exceeds the cluster, placement deadlocks FOREVER
+    # (ray.get(pg.ready()) when colocating, else the actor-group creation) — e.g. a 6-node run left
+    # at the 8-node VLLM_NUM_ENGINES=24 (24*2=48 GPUs leaves 0 for the actor). Error, don't hang.
+    actor_gpus = args.actor.num_nodes * args.actor.num_gpus_per_node
+    model_gpus = (
+        actor_gpus
+        if colocate_fsdp_models
+        else (
+            actor_gpus
+            + (args.ref.num_nodes * args.ref.num_gpus_per_node if has_ref else 0)
+            + (actor_gpus if has_critic else 0)
+        )
+    )
+    vllm_gpus = args.vllm.num_engines * args.vllm.tensor_parallel_size
+    total_gpus = int(ray.cluster_resources().get("GPU", 0))
+    if total_gpus and model_gpus + vllm_gpus > total_gpus:
+        raise RuntimeError(
+            f"GPU over-subscription: FSDP models need {model_gpus} GPUs + vLLM "
+            f"({args.vllm.num_engines} engines x TP{args.vllm.tensor_parallel_size}) = {vllm_gpus} GPUs = "
+            f"{model_gpus + vllm_gpus} > {total_gpus} cluster GPUs. Lower --vllm.num_engines or add nodes. "
+            f"(Otherwise placement deadlocks forever.)"
+        )
+
     if colocate_fsdp_models:
         if has_ref:
             assert (

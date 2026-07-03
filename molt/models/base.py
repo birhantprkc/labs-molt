@@ -704,6 +704,22 @@ class BaseModel(nn.Module):
                             "(prepare_model_inputs_for_cp); this model lacks it — run with "
                             "cp_size=1 (use TP/EP for memory)."
                         )
+                    # Fail fast on image-placeholder tokens with NO multimodal inputs: the rollout
+                    # dropped the image, so prepare_model_inputs_for_cp -> get_rope_index would hit
+                    # image_grid_thw=None and crash cryptically ("'NoneType' is not an iterator").
+                    # A structured-content VLM (Qwen3-VL) renders <image> to a model placeholder, so a
+                    # chat agent that attaches images only at a literal <image> marker attaches none.
+                    # omni3-safe: its image microbatch always has non-empty mm_inputs (pixel_values).
+                    if not mm_inputs and self._image_token_id is not None:
+                        n_img = int((sequences == self._image_token_id).sum().item())
+                        if n_img:
+                            raise RuntimeError(
+                                f"VLM+CP pre-embed: {n_img} image placeholder token(s) present but no "
+                                "multimodal inputs — the rollout dropped the image. Structured-content "
+                                "VLMs render <image> to a model placeholder, so agents that interleave "
+                                "images at a literal <image> marker attach nothing. Fix the chat agent "
+                                "(attach images marker-independently) or use the step runner (geo3k.py)."
+                            )
                     with torch.no_grad():
                         inputs_embeds = self.model(input_ids=sequences, **mm_inputs, _pre_embed_only=True)[
                             "inputs_embeds"

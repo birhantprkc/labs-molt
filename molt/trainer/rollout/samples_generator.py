@@ -1,4 +1,3 @@
-import heapq
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -76,13 +75,16 @@ class SamplesGenerator:
         prompts_dataloader,
         eval_dataloader,
         tokenizer,
-        vllm_engines: List,
+        agent_runners,
     ):
         self.strategy = strategy
         self.args = strategy.args
 
         self.tokenizer = tokenizer
-        self.vllm_engines = vllm_engines or []
+        # Runner actors driving rollouts through the vllm-router; prompts are round-robined
+        # across them (self._rr) — no pool wrapper, just a list + an index.
+        self.agent_runners = agent_runners
+        self._rr = 0
 
         self.prompts_dataloader = prompts_dataloader
         self.eval_dataloader = eval_dataloader
@@ -107,7 +109,7 @@ class SamplesGenerator:
         all_experiences: List[Experience] = []
         try:
             while True:
-                experiences, _, exhausted = self._generate_vllm(
+                experiences, _, exhausted = self._generate_batch(
                     dataloader_iter=self._eval_dataloader_iter,
                     num_prompts=self.args.rollout.batch_size,
                     dynamic_filtering=False,
@@ -159,7 +161,7 @@ class SamplesGenerator:
         )
 
         while finished_group_count() < groups_per_batch:
-            # Refill the pool so the vLLM engines stay saturated at `inflight_capacity`.
+            # Refill so the runner pool keeps `inflight_capacity` rollouts in flight (engines stay saturated).
             free_slots = inflight_capacity - len(self._inflight_rollouts)
             if free_slots > 0 and self._dataloader_iter is not None:
                 prompts, labels, images, dataloader_exhausted = _collect_prompt_batch(
@@ -168,7 +170,7 @@ class SamplesGenerator:
                 prompts_dispatched += len(prompts)
                 if prompts:
                     self._inflight_rollouts.extend(
-                        self._dispatch_prompts_to_vllm(prompts, labels, images=images, **generate_kwargs)
+                        self._dispatch_to_agent_runners(prompts, labels, images=images, **generate_kwargs)
                     )
                 if dataloader_exhausted:
                     self._dataloader_iter = None
@@ -257,7 +259,7 @@ class SamplesGenerator:
         per-response (unusable trajectories, via ``_process_response_into_experience``)
         and the group-level DAPO dynamic-reward filter. Returns ``[]`` when the
         whole group is dropped. Both the streaming (``generate_samples``) and
-        batch/eval (``_generate_vllm``) paths call it, so the per-group filter loop
+        batch/eval (``_generate_batch``) paths call it, so the per-group filter loop
         is never reimplemented.
         """
         group_samples: List[Experience] = []
@@ -275,13 +277,13 @@ class SamplesGenerator:
             if score_stats is not None:
                 scored = [s.scores[0].item() for s in group_samples if s.scores is not None]
                 if scored:
-                    low, high = self.args.algo.dynamic_filtering_range
+                    min_score, max_score = self.args.algo.dynamic_filtering_range
                     gmean = sum(scored) / len(scored)
                     score_stats["score_sum"] += sum(scored)
                     score_stats["score_n"] += len(scored)
                     score_stats["groups"] += 1.0
-                    score_stats["all_pass"] += float(gmean >= high)
-                    score_stats["all_fail"] += float(gmean <= low)
+                    score_stats["all_pass"] += float(gmean >= max_score)
+                    score_stats["all_fail"] += float(gmean <= min_score)
             # Require COMPLETE groups: a group that lost a response to a per-response drop
             # (vlm_truncation / no_action_tokens / logprob_misalign / ...) has < n_samples
             # usable samples, which would pull the accepted count off train_batch_size and make
@@ -302,13 +304,14 @@ class SamplesGenerator:
                 return []
         return group_samples
 
-    def _generate_vllm(
+    def _generate_batch(
         self, dataloader_iter, num_prompts: int, dynamic_filtering, **generate_kwargs
     ) -> Tuple[List[Experience], int, bool]:
         """Generate a batch of Experiences with optional reward filtering.
 
-        Dispatches num_prompts to vLLM engines, collects all results, and returns.
-        When dynamic_filtering is enabled, filtered prompts are replaced with new ones.
+        Dispatches num_prompts across the runner actors (which generate through the
+        vllm-router), collects all results, and returns. When dynamic_filtering is
+        enabled, filtered prompts are replaced with new ones.
         """
         prompts_consumed = 0
         accepted_experiences: List[Experience] = []
@@ -319,7 +322,7 @@ class SamplesGenerator:
             return [], prompts_consumed, True
 
         target_num_prompts = len(prompts)
-        pending_refs = self._dispatch_prompts_to_vllm(prompts, labels, images=images, **generate_kwargs)
+        pending_refs = self._dispatch_to_agent_runners(prompts, labels, images=images, **generate_kwargs)
         prompts_consumed += target_num_prompts
 
         pbar = tqdm(range(target_num_prompts), desc="Generate samples")
@@ -346,7 +349,7 @@ class SamplesGenerator:
                     new_prompts, new_labels, new_images, exhausted = _collect_prompt_batch(dataloader_iter, 1)
                     prompts_consumed += len(new_prompts)
                     if new_prompts:
-                        new_refs = self._dispatch_prompts_to_vllm(
+                        new_refs = self._dispatch_to_agent_runners(
                             new_prompts, new_labels, images=new_images, **generate_kwargs
                         )
                         pending_refs.extend(new_refs)
@@ -355,10 +358,12 @@ class SamplesGenerator:
             logger.info(f"Eval rollout drops: {dict(drop_counts)}")
         return accepted_experiences, prompts_consumed, exhausted
 
-    def _dispatch_prompts_to_vllm(
+    def _dispatch_to_agent_runners(
         self, prompts: List[str], labels: List[str], *, images: List = None, **generate_kwargs
     ) -> List:
-        """Send prompts to rollout executors and return Ray object refs."""
+        """Round-robin each prompt group onto the runner actors; each ``run_group`` returns a
+        Ray ref of that group's Trajectories, consumed by the streaming loop / filtering /
+        experience maker exactly as before."""
         sampling_params = SamplingParams(
             temperature=generate_kwargs.get("temperature", 1.0),
             top_p=generate_kwargs.get("top_p", 1.0),
@@ -370,37 +375,14 @@ class SamplesGenerator:
         )
         truncate_length = generate_kwargs.get("max_len", 2048)
         n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
-
-        # Snapshot current pending rollout counts to balance upcoming work.
-        pending_counts = ray.get([engine.get_num_unfinished_requests.remote() for engine in self.vllm_engines])
-        engine_heap = [(count, idx) for idx, count in enumerate(pending_counts)]
-        heapq.heapify(engine_heap)
-
-        # Pre-compute engine assignment to keep loads even.
-        engine_indices = []
-        for _ in prompts:
-            prev_count, engine_idx = heapq.heappop(engine_heap)
-            engine_indices.append(engine_idx)
-            heapq.heappush(engine_heap, (prev_count + n_samples, engine_idx))
-
         if images is None:
             images = [None] * len(prompts)
 
         refs = []
-        for idx, (prompt, label, img) in enumerate(zip(prompts, labels, images)):
-            # Spread work across engines/workers in load-aware order.
-            llm_engine = self.vllm_engines[engine_indices[idx]]
-            ref = llm_engine.generate_responses.remote(
-                prompt=prompt,
-                label=label,
-                sampling_params=sampling_params,
-                max_length=truncate_length,
-                hf_tokenizer=self.tokenizer,
-                num_samples=n_samples,
-                images=img,
-            )
-            refs.append(ref)
-
+        for prompt, label, img in zip(prompts, labels, images):
+            actor = self.agent_runners[self._rr % len(self.agent_runners)]
+            self._rr += 1
+            refs.append(actor.run_group.remote(prompt, label, img, sampling_params, truncate_length, n_samples))
         return refs
 
     def _media_token_ids(self) -> set:

@@ -118,6 +118,11 @@ class ChatAgent(ABC):
 # a list of Trajectory step-samples the trainer consumes.
 # ---------------------------------------------------------------------------
 class ChatAgentRunner(Runner):
+    # Feeds RAW user content to the chat server, which renders exactly once via the model's own
+    # chat template. So the dataset must NOT pre-render (that would double-template and drop the
+    # image on structured-content VLMs). The trainer reads this to auto-disable --data.apply_chat_template.
+    PRERENDER_PROMPT = False
+
     def __init__(self, agent_cls: type[ChatAgent]):
         assert issubclass(agent_cls, ChatAgent), "agent_cls must inherit from ChatAgent"
         self.agent_cls = agent_cls
@@ -127,9 +132,9 @@ class ChatAgentRunner(Runner):
         self._boot_lock = asyncio.Lock()  # serialize first-call server bring-up
 
     async def _ensure_server(self, llm_engine, hf_tokenizer, max_length, sampling_params):
-        """Bring the transparent token-in-token-out server up once, on the actor's
-        OWN event loop (so it shares the AsyncLLM engine — no daemon thread, no
-        cross-loop await). Concurrent first calls are serialized; later return at once."""
+        """Bring the loopback chat forwarder up once, on the actor's OWN event loop.
+        It forwards each turn over HTTP to the router (via the transport's shared aiohttp
+        session). Concurrent first calls are serialized; later return at once."""
         if self._state is not None:
             return
         async with self._boot_lock:
@@ -143,8 +148,8 @@ class ChatAgentRunner(Runner):
             async def _health():
                 return {"status": "ok", "model": _SERVED_MODEL_NAME}
 
-            # engine = the rollout actor; state.engine.generate(token_ids, sp, mm_data)
-            # is the token-in path that returns exact generated ids + logprobs.
+            # transport = the shared RouterGenerateClient; the forwarder renders each turn client-side
+            # and generates token-in via the transport (/inference/v1/generate) — see _chat_server.
             state = ChatServerState(llm_engine, hf_tokenizer, _SERVED_MODEL_NAME, max_length, sampling_params)
             mount_session_capture(app, state)
             port, self._server_task = await serve_on_current_loop(app)
@@ -155,7 +160,9 @@ class ChatAgentRunner(Runner):
     async def execute(self, prompt, label, sampling_params, max_length, hf_tokenizer, llm_engine, images=None):
         await self._ensure_server(llm_engine, hf_tokenizer, max_length, sampling_params)
         session_id = uuid4().hex
-        self._state.open(session_id, prompt, label, images)
+        # Pass THIS call's sampling_params so the server defaults each turn to the right train-vs-eval
+        # temperature/max_tokens even if the agent doesn't re-send them (see _Session.sampling_params).
+        self._state.open(session_id, prompt, label, images, sampling_params)
         session_root = f"{self._server_root}/s/{session_id}"
         ctx = ChatContext(
             prompt=prompt,

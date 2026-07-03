@@ -331,11 +331,7 @@ class PolicyTrainer:
 
         # Stage 1: prepare tensors and optional multimodal inputs.
         multimodal_inputs = {}
-        if (
-            hasattr(experience, "mm_train_inputs")
-            and experience.mm_train_inputs
-            and getattr(self.actor, "is_vlm", False)
-        ):
+        if experience.mm_train_inputs and getattr(self.actor, "is_vlm", False):
             multimodal_inputs = merge_mm_train_inputs(experience.mm_train_inputs, sequences.device)
 
         # AutoModel CP train context must cover both forward and backward.

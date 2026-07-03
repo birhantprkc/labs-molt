@@ -2,7 +2,6 @@ import asyncio
 import dataclasses
 import inspect
 import os
-from copy import deepcopy
 from typing import Any, List, Optional
 
 import ray
@@ -10,10 +9,6 @@ import vllm
 from packaging import version
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from vllm.inputs import TokensPrompt
-from vllm.utils import random_uuid
-
-from molt.agents.base import Runner
 
 from molt.trainer.placement import get_bundle_indices, ray_noset_visible_devices
 
@@ -23,20 +18,6 @@ _MIN_VLLM_VERSION = version.parse("0.21.0")
 def _assert_supported_vllm():
     if version.parse(vllm.__version__) < _MIN_VLLM_VERSION:
         raise RuntimeError(f"vLLM >= 0.21.0 is required, got {vllm.__version__}.")
-
-
-def _load_agent_runner(agent_path: str) -> Runner:
-    assert agent_path.endswith(".py"), "Agent path must be a Python file"
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("agent_module", agent_path)
-    agent_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(agent_module)
-
-    assert hasattr(agent_module, "AgentRunner"), "Agent module must contain AgentRunner class"
-    agent_runner_cls = agent_module.AgentRunner
-    assert issubclass(agent_runner_cls, Runner), "AgentRunner must inherit from Runner"
-    return agent_runner_cls()
 
 
 def _format_ray_gpu_ids(gpu_ids) -> str:
@@ -102,16 +83,7 @@ def _filter_vllm_engine_kwargs(kwargs: dict) -> dict:
 class RolloutRayActor:
     """Async vLLM-backed actor that exposes generation utilities."""
 
-    async def __init__(
-        self,
-        *args,
-        bundle_indices: list = None,
-        agent_path: Optional[str] = None,
-        mm_pad_token_ids: Optional[set] = None,
-        mm_image_placeholder_id: Optional[int] = None,
-        mm_image_start_ids: Optional[set] = None,
-        **kwargs,
-    ):
+    async def __init__(self, *args, bundle_indices: list = None, **kwargs):
         backend = kwargs.get("distributed_executor_backend")
         num_gpus = kwargs.pop("num_gpus")
         self._configure_device_env(
@@ -121,31 +93,67 @@ class RolloutRayActor:
         )
         self._configure_vllm_env(kwargs.pop("full_determinism", False))
 
-        if not agent_path:
-            raise ValueError("RolloutRayActor requires --train.agent_path.")
-        self.runner = _load_agent_runner(agent_path)
-
         self.kwargs = kwargs
 
         engine_args = vllm.AsyncEngineArgs(*args, **_filter_vllm_engine_kwargs(self.kwargs))
         self.llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
         print("vLLM AsyncLLMEngine constructed", flush=True)
 
-        # Used by generate() to collapse pre-expanded image/video pad tokens
-        # before passing to vLLM (avoids double-expansion).
-        self._mm_pad_token_ids = mm_pad_token_ids
-        self._mm_image_placeholder_id = mm_image_placeholder_id
-        # Start-marker ids: keep adjacent images distinct during dedup.
-        self._mm_image_start_ids = mm_image_start_ids
-        # Bumped on every weight broadcast; generate() reads it to detect a swap
-        # that lands mid-generation (partial rollout) and report the off-policy
-        # token boundary. Streaming requests may span a refit in either rollout
-        # mode because generate_samples returns before its slow tail finishes.
-        self._weight_version = 0
-
     async def ready(self) -> bool:
         """Confirm Ray actor construction has completed."""
         return True
+
+    async def serve_openai(self, host: str = "0.0.0.0", port: int = 0) -> str:
+        """Mount vLLM's OpenAI API server on THIS engine and return its URL.
+
+        The router (vllm-router) fronts these per-engine servers for generation; we keep
+        ``self.llm`` in the actor so weight sync (``collective_rpc`` over the NCCL group)
+        is untouched and bypasses the router. Uvicorn runs on the actor's OWN event loop
+        (shared with the AsyncLLM engine — no extra process), same pattern as the chat
+        server. Client sets the token-in/out flags per request (``prompt=[ids]``,
+        ``return_token_ids``, ``logprobs``); the server just serves ``self.llm``.
+        """
+        import uvicorn
+        from vllm.entrypoints.openai import api_server as _api
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+
+        try:  # location moved across vLLM versions (utils.argparse_utils -> entrypoints.utils)
+            from vllm.utils.argparse_utils import FlexibleArgumentParser
+        except ImportError:
+            from vllm.entrypoints.utils import FlexibleArgumentParser
+
+        args = make_arg_parser(FlexibleArgumentParser()).parse_args([])
+        args.model = self.kwargs.get("model")
+        args.served_model_name = ["policy"]  # clients request model="policy"
+        args.host, args.port = host, port
+
+        supported_tasks = await self.llm.get_supported_tasks()
+        model_config = self.llm.model_config
+        # build_app / init_app_state signatures vary across vLLM versions; try the
+        # newer (args, supported_tasks, model_config) form, fall back to (args).
+        try:
+            app = _api.build_app(args, supported_tasks, model_config)
+        except TypeError:
+            app = _api.build_app(args)
+        try:  # supported_tasks arg was added in a later vLLM; fall back to the 3-arg form
+            await _api.init_app_state(self.llm, app.state, args, supported_tasks)
+        except TypeError:
+            await _api.init_app_state(self.llm, app.state, args)
+
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        # vLLM's error handlers (e.g. the disagg /inference/v1/generate path) reach for
+        # ``app.state.server`` to terminate on a fatal engine error; the standard run_server
+        # launcher sets it, but we mount uvicorn ourselves, so set it here too (else a real
+        # GenerationError gets masked by "'State' object has no attribute 'server'").
+        app.state.server = server
+        self._server_task = asyncio.create_task(server.serve())
+        while not server.started:  # wait for the OS-assigned port to bind
+            await asyncio.sleep(0.1)
+        actual_port = server.servers[0].sockets[0].getsockname()[1]
+        self._server_url = f"http://{ray.util.get_node_ip_address()}:{actual_port}"
+        print(f"vLLM OpenAI server up at {self._server_url}", flush=True)
+        return self._server_url
 
     def _configure_device_env(self, backend, bundle_indices, worker_num_gpus):
         if backend == "ray":
@@ -195,9 +203,6 @@ class RolloutRayActor:
             "update_weights_packed",
             args=(metas,),
         )
-        # New policy version is now live on the workers. generate() loops compare
-        # against this to mark tokens produced before the swap as off-policy.
-        self._weight_version += 1
         return result
 
     async def pause_generation(self):
@@ -214,110 +219,6 @@ class RolloutRayActor:
         logprobs. The trainer skips this when prefix caching is off (caller-gated).
         """
         await self.llm.reset_prefix_cache()
-
-    async def generate(self, prompt_token_ids, sampling_params, multi_modal_data=None):
-        """Token-level generation for rollout executors."""
-        if multi_modal_data and self._mm_pad_token_ids:
-            # Collapse consecutive image/video pad tokens to a single
-            # placeholder so vLLM's multimodal processor expands them
-            # exactly once (avoids double-expansion).
-            from molt.utils.vlm_utils import dedup_media_tokens
-
-            prompt_token_ids = dedup_media_tokens(
-                prompt_token_ids,
-                self._mm_pad_token_ids,
-                self._mm_image_placeholder_id,
-                image_start_ids=self._mm_image_start_ids,
-            )
-
-        prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
-        if multi_modal_data:
-            prompt["multi_modal_data"] = multi_modal_data
-
-        generator = self.llm.generate(
-            prompt,
-            deepcopy(sampling_params),
-            request_id=random_uuid(),
-        )
-
-        # Track the off-policy boundary for partial rollout: if a weight broadcast
-        # lands while this request is in flight (pause_generation freezes it, the
-        # weights swap, resume_generation continues it), every token produced
-        # BEFORE the swap was sampled by stale weights and is off-policy w.r.t. the
-        # post-swap weights the trainer recomputes against. We record the token
-        # count at the LATEST such swap; the agent runner passes it to
-        # Trajectory.append_action, which drops [:off_policy_len] from the action
-        # mask (slime's mask_offpolicy_in_partial_rollout — zero gradient AND out of
-        # the token-mean denominator). off_policy_len stays 0 when no swap spans
-        # this call.
-        start_version = self._weight_version
-        off_policy_len = 0
-        prev_token_count = 0
-        final_output = None
-        async for request_output in generator:
-            if self._weight_version != start_version:
-                off_policy_len = prev_token_count
-                start_version = self._weight_version
-            prev_token_count = len(request_output.outputs[0].token_ids)
-            final_output = request_output
-
-        return final_output, off_policy_len
-
-    def get_num_unfinished_requests(self) -> int:
-        """Number of unfinished requests in vLLM engine."""
-        return self.llm.output_processor.get_num_unfinished_requests()
-
-    async def generate_responses(
-        self,
-        prompt: str,
-        label: str,
-        sampling_params,
-        max_length: int,
-        hf_tokenizer,
-        num_samples: int = 1,
-        images=None,
-    ):
-        """Generate N rollouts for a single prompt. Each `execute()` returns a
-        `Trajectory` (or, for custom runners, a list of them — multi-turn agents
-        may flatten to one sample per step). Tag every item with:
-          - `group_id`: one per prompt — N rollouts of this prompt share it,
-            so the trainer averages their rewards as the GRPO baseline.
-          - `rollout_id`: one per rollout — multi-turn step-samples of the
-            same rollout share it, so the trainer dedups to one reward each."""
-        from uuid import uuid4
-
-        group_id = uuid4().hex  # prompt-level: one per generate_responses call
-        tasks = [
-            self.runner.execute(
-                prompt=prompt,
-                label=label,
-                sampling_params=deepcopy(sampling_params),
-                max_length=max_length,
-                hf_tokenizer=hf_tokenizer,
-                llm_engine=self,
-                images=images,
-            )
-            for _ in range(num_samples)
-        ]
-        # return_exceptions=True: one failed rollout (vLLM hiccup, agent-runner
-        # error, overlong/prefix drift) must NOT take down the whole prompt group.
-        # Without it the exception propagates through the upstream
-        # ray.get(finished_rollout) and crashes the GenerateSamplesActor, killing
-        # the run. Drop the failed rollout(s) and keep the rest — slime (#1982)
-        # masks & continues the same way. If every rollout fails the group comes
-        # back empty and the generator refills its slot with a fresh prompt.
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        flattened = []
-        for r in results:
-            if isinstance(r, BaseException):
-                print(f"[rollout] dropping failed rollout in group {group_id}: {r!r}", flush=True)
-                continue
-            rollout_id = uuid4().hex
-            for traj in r if isinstance(r, list) else [r]:
-                traj.group_id = group_id
-                traj.rollout_id = rollout_id
-                flattened.append(traj)
-        return flattened
 
 
 def create_vllm_engines(
@@ -338,7 +239,6 @@ def create_vllm_engines(
     # that align with the actor.
     # Pass None to fall back to vLLM's raw behavior.
     logprobs_mode="processed_logprobs",
-    agent_path: Optional[str] = None,
     max_images_per_prompt: int = 0,
     mm_encoder_attn_backend: Optional[str] = None,
     gdn_prefill_backend: Optional[str] = None,
@@ -376,37 +276,6 @@ def create_vllm_engines(
     (a Ray bundle cannot span nodes), so cross-node engines need the ray backend.
     """
     _assert_supported_vllm()
-
-    # Detect VLM pad token IDs once, shared across all engines. Also pick up
-    # bracket-style border tokens (image_start_token / image_end_token) when
-    # the processor exposes them — pre-expanded prompts mix borders with
-    # pad runs, and dedup collapses the whole block to ``image_token_id`` for
-    # vLLM to re-expand exactly once.
-    mm_pad_token_ids: set = set()
-    mm_image_placeholder_id: Optional[int] = None
-    mm_image_start_ids: set = set()
-    if max_images_per_prompt > 0:
-        from transformers import AutoProcessor
-
-        processor = AutoProcessor.from_pretrained(pretrain, trust_remote_code=True)
-        for attr in ("image_token_id", "video_token_id"):
-            tid = getattr(processor, attr, None)
-            if tid is not None:
-                mm_pad_token_ids.add(tid)
-        mm_image_placeholder_id = getattr(processor, "image_token_id", None)
-        tokenizer = getattr(processor, "tokenizer", None)
-        for tok_attr in ("image_start_token", "image_end_token", "video_start_token", "video_end_token"):
-            tok_str = getattr(processor, tok_attr, None)
-            if tok_str and tokenizer is not None:
-                tid = tokenizer.convert_tokens_to_ids(tok_str)
-                if isinstance(tid, int) and tid >= 0:
-                    mm_pad_token_ids.add(tid)
-                    # Track the start markers separately: dedup uses them as
-                    # per-image boundaries so back-to-back image blocks don't
-                    # collapse into a single placeholder.
-                    if tok_attr in ("image_start_token", "video_start_token"):
-                        mm_image_start_ids.add(tid)
-        del processor
 
     vllm_engines = []
     distributed_executor_backend = distributed_executor_backend or ("uni" if tensor_parallel_size == 1 else "ray")
@@ -461,10 +330,6 @@ def create_vllm_engines(
             "bundle_indices": bundle_indices,
             "num_gpus": num_gpus,
             "worker_num_gpus": worker_num_gpus,
-            "agent_path": agent_path,
-            "mm_pad_token_ids": mm_pad_token_ids,
-            "mm_image_placeholder_id": mm_image_placeholder_id,
-            "mm_image_start_ids": mm_image_start_ids,
         }
 
         if max_images_per_prompt > 0:

@@ -382,6 +382,13 @@ if [ "$FREEZE_MOE_ROUTER" = "1" ]; then
   RL_ARGS+=(--actor.freeze_moe_router)
 fi
 
+# omni3 is MoE -> R3 (routing replay) on by default: replay the rollout's per-token expert
+# selection so the student's training router matches its rollout router (lower vllm_kl). Set
+# ROUTING_REPLAY=0 to disable. Incompatible with partial rollout (keep PARTIAL_ROLLOUT off).
+if [ "${ROUTING_REPLAY:-1}" != "0" ]; then
+  RL_ARGS+=(--train.routing_replay)
+fi
+
 if [ "${LOAD_ENABLE:-0}" = "1" ]; then
   RL_ARGS+=(--ckpt.load_enable)
 fi

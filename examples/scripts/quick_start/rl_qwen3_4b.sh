@@ -61,7 +61,6 @@ python3 -u -m molt.cli.train_rl_ray \
   --train.max_epochs 1 \
   --train.num_episodes 1 \
   --train.async_queue_size 2 \
-  --train.partial_rollout_enable \
   --train.colocate_fsdp_models \
   --actor.num_nodes 1 \
   --actor.num_gpus_per_node "$ACTOR_GPUS" \

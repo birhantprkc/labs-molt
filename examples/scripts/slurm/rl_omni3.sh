@@ -28,7 +28,9 @@ export MOLT_PATH="$REPO_ROOT"
 # If the loud "[AutoModel] WARNING: no native ... falling back to HuggingFace"
 # line appears, the pin regressed: bump requirements.txt / the sibling Automodel
 # checkout so the architecture re-registers.
-export MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/.tmp/nemotron_omni_v3_shim/iter_0001926_mcore_to_hf}"
+# omni3 GA (released) checkpoint — the aligned model. The old mcore->hf shim
+# (.tmp/nemotron_omni_v3_shim/iter_0001926_mcore_to_hf) gave low geo3k reward.
+export MODEL_PATH="${MODEL_PATH:-/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/llm-models/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16}"
 export TP_SIZE="${TP_SIZE:-1}"        # AutoModel custom MoE asserts TP=1
 export EP_SIZE="${EP_SIZE:-8}"        # only model-state shard knob for this MoE
 export CP_SIZE="${CP_SIZE:-8}"        # CP8 fits 32K on the 2-node DP2 actor (omni3 SFT-validated 4679193); hybrid-SSM CP fix is in
@@ -105,8 +107,9 @@ if [ "$CHAIN_DEPTH" -lt "$CHAIN_MAX" ]; then
   NEXT_DEPTH=$((CHAIN_DEPTH + 1))
   next_jobid=$(CHAIN_DEPTH="$NEXT_DEPTH" LOAD_ENABLE=1 \
     sbatch --parsable --dependency=afterany:"$SLURM_JOB_ID" \
+    --account="$SLURM_JOB_ACCOUNT" \
     --partition="$SLURM_JOB_PARTITION" \
-    --qos="$SLURM_JOB_QOS" \
+    ${SLURM_JOB_QOS:+--qos="$SLURM_JOB_QOS"} \
     ${SLURM_JOB_RESERVATION:+--reservation="$SLURM_JOB_RESERVATION"} \
     --nodes="$SLURM_JOB_NUM_NODES" \
     --comment='{"IdleGpuReaper":{"exemptIdleTimeMins":"120","reason":"other","description":"Async RL split actor+vLLM; GPUs idle as train/rollout/eval alternate; omni3 32K MoE"}}' \
@@ -140,7 +143,7 @@ PROMPT_DATASET="${PROMPT_DATASET:-$DEFAULT_DATA_DIR/train}"
 EVAL_DATASET="${EVAL_DATASET:-$DEFAULT_DATA_DIR/eval}"
 
 SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/molt-async-visual-rl/$SLURM_JOB_ID}"
-AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/chat_geo3k.py}"
+AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/geo3k.py}"
 
 # Default the AutoModel source override to the sibling checkout if it exists, so
 # the latest main wins over the version baked into the container image.
@@ -307,6 +310,11 @@ if [ "${MOLT_INSTALL_AUDIO:-0}" = "1" ]; then
   ray_env="$ray_env && (python3 -c 'import soundfile' 2>/dev/null || python3 -m pip install -q 'vllm[audio]')"
 fi
 
+# The rollout routes through the real Rust vllm-router, which isn't in the base image. Install it in
+# every container before ray start (idempotent) from the wheel pre-cached on /lustre (mounted at
+# /molt) so it works even on air-gapped compute nodes. Permanent fix = bake it into the Dockerfile.
+ray_env="$ray_env && (python3 -c 'import vllm_router' 2>/dev/null || python3 -m pip install -q --break-system-packages /molt/.tmp/vllm_router_wheel/vllm_router-*.whl)"
+
 srun --nodes=1 --ntasks=1 -w "$head_node" "${CONTAINER_ARGS[@]}" bash -lc "
 set -e
 # GPU preflight.
@@ -373,6 +381,9 @@ while True:
     time.sleep(5)
 PY"
 
+# --data.apply_chat_template: the STEP runner needs a pre-rendered prompt; the CHAT runner
+# feeds RAW content (the chat server renders once via the model's own template), so the trainer
+# AUTO-DISABLES this for chat runners (Runner.PRERENDER_PROMPT) — model-agnostic, no shell branch.
 RL_ARGS=(
   --actor.model_name_or_path "$MODEL_PATH"
   --data.prompt_dataset "$PROMPT_DATASET"
@@ -387,6 +398,7 @@ RL_ARGS=(
   ${MAX_NEW_TOKENS:+--rollout.max_new_tokens=$MAX_NEW_TOKENS}
   --rollout.batch_size "$ROLLOUT_BATCH_SIZE"
   --rollout.vllm_generate_batch_size "$ROLLOUT_GENERATE_BATCH_SIZE"
+  --rollout.num_runners "${NUM_RUNNERS:-8}"
   --rollout.micro_batch_size 1
   --rollout.n_samples_per_prompt "$N_SAMPLES_PER_PROMPT"
   --rollout.temperature "$TEMPERATURE"
@@ -397,7 +409,7 @@ RL_ARGS=(
   --train.num_episodes "${NUM_EPISODES:-1}"
   --train.async_queue_size "$ASYNC_QUEUE_SIZE"
   --train.colocate_fsdp_models
-  ${ROUTING_REPLAY:+--train.routing_replay}
+  $([ "${ROUTING_REPLAY:-1}" != 0 ] && echo --train.routing_replay || true)
   --actor.num_nodes "$ACTOR_NODES"
   --actor.num_gpus_per_node "$ACTOR_GPUS_PER_NODE"
   --ref.num_nodes "$ACTOR_NODES"

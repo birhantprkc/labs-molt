@@ -205,7 +205,6 @@ class RayActorGroup:
 
             # PACK (not SPREAD) packs the actor's GPUs onto as few nodes as possible.
             pg = placement_group(bundles, strategy="PACK")
-            ray.get(pg.ready())
 
         # Ray PACK does NOT guarantee bundle index == node order (ray #51117): at
         # >2 nodes Ray can interleave bundle indices across nodes, so rank i -> bundle i

@@ -54,8 +54,9 @@ python3 -u -m molt.cli.train_rl_ray \
   --data.prompt_dataset "$PROMPT_DATASET" \
   --data.input_key prompt \
   --data.label_key reward_model \
-  --data.image_key images \
+  --data.tools_key tools \
   --data.apply_chat_template \
+  --data.image_key images \
   --data.max_images_per_prompt 1 \
   --data.max_samples 4096 \
   --data.max_len 16384 \
@@ -70,7 +71,7 @@ python3 -u -m molt.cli.train_rl_ray \
   --train.max_epochs 1 \
   --train.num_episodes 1 \
   --train.async_queue_size 2 \
-  --train.partial_rollout_enable \
+  --train.routing_replay \
   --train.colocate_fsdp_models \
   --actor.num_nodes 1 \
   --actor.num_gpus_per_node "$ACTOR_GPUS" \

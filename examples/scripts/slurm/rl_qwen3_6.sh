@@ -102,8 +102,10 @@ if [ "$CHAIN_DEPTH" -lt "$CHAIN_MAX" ]; then
   NEXT_DEPTH=$((CHAIN_DEPTH + 1))
   next_jobid=$(CHAIN_DEPTH="$NEXT_DEPTH" LOAD_ENABLE=1 SBATCH_COMMENT="$SBATCH_COMMENT" \
     sbatch --parsable --dependency=afterany:"$SLURM_JOB_ID" \
+    --account="$SLURM_JOB_ACCOUNT" \
     --partition="$SLURM_JOB_PARTITION" \
-    --qos="$SLURM_JOB_QOS" \
+    ${SLURM_JOB_QOS:+--qos="$SLURM_JOB_QOS"} \
+    ${SLURM_JOB_RESERVATION:+--reservation="$SLURM_JOB_RESERVATION"} \
     --nodes="$SLURM_JOB_NUM_NODES" \
     --comment="$SBATCH_COMMENT" \
     "$REPO_ROOT/examples/scripts/slurm/rl_qwen3_6.sh")
@@ -132,7 +134,7 @@ PROMPT_DATASET="${PROMPT_DATASET:-$DEFAULT_DATA_DIR/train}"
 EVAL_DATASET="${EVAL_DATASET:-$DEFAULT_DATA_DIR/eval}"
 
 SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/molt-async-visual-rl/$SLURM_JOB_ID}"
-AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/chat_geo3k.py}"
+AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/geo3k.py}"
 
 # Default the AutoModel source override to the sibling checkout if it exists, so
 # the latest main wins over the version baked into the container image.
@@ -330,6 +332,9 @@ while True:
     time.sleep(5)
 PY"
 
+# --data.apply_chat_template: the STEP runner needs a pre-rendered prompt; the CHAT runner
+# feeds RAW content (the chat server renders once via the model's own template), so the trainer
+# AUTO-DISABLES this for chat runners (Runner.PRERENDER_PROMPT) — model-agnostic, no shell branch.
 RL_ARGS=(
   --actor.model_name_or_path "$MODEL_PATH"
   --data.prompt_dataset "$PROMPT_DATASET"
@@ -354,7 +359,7 @@ RL_ARGS=(
   --train.num_episodes "${NUM_EPISODES:-1}"
   --train.async_queue_size "$ASYNC_QUEUE_SIZE"
   --train.colocate_fsdp_models
-  ${ROUTING_REPLAY:+--train.routing_replay}
+  $([ "${ROUTING_REPLAY:-1}" != 0 ] && echo --train.routing_replay || true)
   --actor.num_nodes "$ACTOR_NODES"
   --actor.num_gpus_per_node "$ACTOR_GPUS_PER_NODE"
   --ref.num_nodes "$ACTOR_NODES"

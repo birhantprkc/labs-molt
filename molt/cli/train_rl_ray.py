@@ -64,7 +64,6 @@ def train(args):
             max_len,
             args.vllm.gpu_memory_utilization,
             "processed_logprobs" if args.algo.advantage.is_correction_enable else None,
-            agent_path=args.train.agent_path,
             max_images_per_prompt=getattr(args.data, "max_images_per_prompt", 0),
             mm_encoder_attn_backend=args.vllm.mm_encoder_attn_backend,
             gdn_prefill_backend=args.vllm.gdn_prefill_backend,
@@ -165,6 +164,19 @@ def train(args):
     else:
         critic_model = None
 
+    # Rollout gateway: serve each engine's OpenAI API + the real vllm-router in front of them.
+    # Rollouts run through a runner pool -> gateway (generation); weight sync still goes straight
+    # to the engine workers (bypasses the gateway).
+    router_url = None
+    vllm_router = None  # MUST stay in scope for the whole run — the router actor dies if GC'd
+    if vllm_engines:
+        from molt.rollout.router import create_vllm_router
+
+        vllm_router, router_url = create_vllm_router(
+            vllm_engines, policy=getattr(args.vllm, "router_policy", "consistent_hash")
+        )
+        print(f"[rollout] gateway up at {router_url} fronting {len(vllm_engines)} engines", flush=True)
+
     from molt.trainer.rl_trainer import RLTrainer
 
     # init RL trainer (single controller)
@@ -175,6 +187,7 @@ def train(args):
         ref_model,
         vllm_engines,
         critic_model_group=critic_model,
+        router_url=router_url,
         # generate kwargs
         do_sample=True,
         max_len=max_len,
@@ -431,6 +444,13 @@ if __name__ == "__main__":
     parser.add_argument("--vllm.sync_backend", type=str, default="nccl", help="trainer -> vLLM weight sync backend")
     parser.add_argument("--vllm.enforce_eager", action="store_true", default=False, help="Disable CUDA graph in vLLM")
     parser.add_argument(
+        "--vllm.router_policy",
+        type=str,
+        default="consistent_hash",
+        help="vllm-router policy (default consistent_hash: x-session-id affinity pins a rollout's "
+        "render+generate to one engine for mm-feature cache; cache_aware | round_robin | power_of_two | random)",
+    )
+    parser.add_argument(
         "--vllm.mtp_num_speculative_tokens",
         type=int,
         default=0,
@@ -523,6 +543,12 @@ if __name__ == "__main__":
     )
     # -- sampling & rollout batching --
     parser.add_argument("--rollout.batch_size", type=int, default=1024, help="Batch size for make experience")
+    parser.add_argument(
+        "--rollout.num_runners",
+        type=int,
+        default=2,
+        help="Router path: number of runner-pool actors (rollouts + in-process reward grading)",
+    )
     parser.add_argument(
         "--rollout.vllm_generate_batch_size", type=int, default=None, help="Batch size for vLLM generating samples"
     )
@@ -698,9 +724,29 @@ if __name__ == "__main__":
         ), "n_samples_per_prompt must be greater than 1 when using dynamic filtering"
 
     if not args.algo.advantage.is_correction_enable:
+        # The HTTP router path can't observe a mid-request weight swap, so off_policy_len is always 0
+        # (no slime-style masking of stale-weight tokens). Async rollout (crosses broadcasts between
+        # requests) and partial rollout (preempts mid-request at every weight sync) both then feed
+        # off-policy tokens into the loss uncorrected AND unmasked -> fail fast instead of silently
+        # biasing the update. Per-token IS (is_correction_enable) is the correction that replaces it.
+        if args.train.async_queue_size > 1 or args.train.partial_rollout_enable:
+            raise ValueError(
+                "Off-policy rollout (--train.async_queue_size > 1 or --train.partial_rollout_enable) "
+                "produces tokens across weight broadcasts that the router path does NOT mask "
+                "(off_policy_len is always 0 over HTTP). Enable --algo.advantage.is_correction_enable "
+                "(per-token IS corrects them), or run synchronously (--train.async_queue_size 1, no "
+                "--train.partial_rollout_enable)."
+            )
         print(
-            "[Warning] Async rollout samples may be off-policy. Enable "
+            "[Warning] Rollout samples may be off-policy. Enable "
             "--algo.advantage.is_correction_enable to correct rollout logprobs during training."
+        )
+    elif args.train.partial_rollout_enable:
+        # IS is on, so the off-policy tokens are corrected; note only that slime-style MASKING is not.
+        print(
+            "[Warning] --train.partial_rollout_enable: slime-style off-policy token MASKING "
+            "(off_policy_len) is INACTIVE on the HTTP router path — the transport can't observe a "
+            "mid-request weight swap. Per-token IS is correcting those tokens instead."
         )
 
     # --- Data ---

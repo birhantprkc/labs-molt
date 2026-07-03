@@ -35,7 +35,17 @@ def preprocess_data(
             kwargs["tools"] = tools
         prompt = apply_chat_template(chat, tokenize=False, add_generation_prompt=True, **kwargs)
     else:
+        # apply_chat_template OFF = feed RAW content (the CHAT path: the chat server renders once via
+        # the model's own processor, so a pre-rendered prompt would double-template + drop the image
+        # for structured-content VLMs). If the dataset stores the prompt as a chat message list, take
+        # the raw user-turn text so the chat agent builds OpenAI messages from it. Model-agnostic —
+        # no per-model branching (kimi2.6 / glm5.x / minimax / qwen3.x / omni3 all handled the same).
         prompt = data[input_key]
+        if isinstance(prompt, list):
+            user_text = [
+                m.get("content") for m in prompt if m.get("role") == "user" and isinstance(m.get("content"), str)
+            ]
+            prompt = user_text[-1] if user_text else prompt
         if input_template:
             prompt = input_template.format(prompt)
 

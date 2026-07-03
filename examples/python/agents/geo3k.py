@@ -91,10 +91,16 @@ def _extract_tool_call(text: str) -> dict[str, Any] | None:
 def _grade_answer(text: str, label) -> tuple[float, str]:
     if not label:
         return 0.0, ""
-    matches = _ANSWER_RE.findall(text) or _BOXED_RE.findall(text)
-    if not matches:
+    answers = _ANSWER_RE.findall(text)
+    if answers:
+        answer = answers[-1].strip()
+    else:
+        # Balanced \boxed/\fbox extraction — handles nested braces (\boxed{\frac{1}{2}})
+        # that the flat _BOXED_RE truncates to no-match (=0 reward). chat_geo3k parity.
+        boxed = _GRADER._last_braced_command(text, r"\boxed") or _GRADER._last_braced_command(text, r"\fbox")
+        answer = boxed.strip() if boxed else ""
+    if not answer:
         return 0.0, ""
-    answer = matches[-1].strip()
     try:
         result = _GRADER.score_response(f"\\boxed{{{answer}}}", "", label)
         return float(result.get("reward", 0.0)), answer
@@ -104,17 +110,21 @@ def _grade_answer(text: str, label) -> tuple[float, str]:
 
 
 # Qwen3.5/3.6 chat-template wrapping: tool responses live inside
-# <|im_start|>user<tool_response>...</tool_response><|im_end|>.
+# <|im_start|>user<tool_response>...</tool_response><|im_end|>. The leading
+# <|im_end|> CLOSES the model's assistant turn: vLLM excludes the stop token from
+# the generated ids (no include_stop_str_in_output), so the action carries no
+# trailing <|im_end|>; supplying it here matches the chat-template boundary exactly
+# (...</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>...) — chat_geo3k parity.
 def _tool_observation(content: str) -> str:
     return (
-        "\n<|im_start|>user\n"
+        "<|im_end|>\n<|im_start|>user\n"
         f"<tool_response>\n{content}\n</tool_response><|im_end|>\n"
         "<|im_start|>assistant\n<think>\n"
     )
 
 
 def _final_observation(status: str) -> str:
-    return f"\n<|im_start|>user\n{status}<|im_end|>\n"
+    return f"<|im_end|>\n<|im_start|>user\n{status}<|im_end|>\n"
 
 
 class GeoEnv(Env):

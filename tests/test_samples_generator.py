@@ -66,7 +66,7 @@ def _wire_fake_vllm(generator, monkeypatch, to_sample):
     prompt string; ray.wait hands them back in dispatch order and ray.get turns a
     handle into its single response, which `to_sample` maps to an Experience.
     """
-    generator._dispatch_prompts_to_vllm = lambda prompts, labels, images, **kw: [
+    generator._dispatch_to_agent_runners = lambda prompts, labels, images, **kw: [
         SimpleNamespace(group_id=prompt) for prompt in prompts
     ]
     generator._process_response_into_experience = lambda response, **kw: (to_sample(response.group_id), None)

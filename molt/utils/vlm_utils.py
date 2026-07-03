@@ -6,7 +6,6 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -230,44 +229,6 @@ def process_prompt_with_images(
     _skip_keys = {"input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids"}
     mm_train_inputs = {k: v for k, v in proc_out.items() if k not in _skip_keys}
     return token_ids, (mm_train_inputs or None), pil_images
-
-
-def dedup_media_tokens(
-    token_ids: List[int],
-    pad_token_ids: set,
-    placeholder_id: Optional[int] = None,
-    image_start_ids: Optional[set] = None,
-) -> List[int]:
-    """Collapse consecutive image/video pad tokens to a single placeholder.
-
-    vLLM expects one placeholder per image and expands it internally; passing
-    already-expanded token IDs causes double-expansion.
-
-    Processors that pre-expand into a bracketed run (start-marker + pad×N +
-    end-marker) should pass all three ids in ``pad_token_ids`` and set
-    ``placeholder_id`` to the canonical id vLLM searches for; borders are
-    rewritten to the placeholder before dedup so the surviving token is the
-    one vLLM expects.
-
-    ``image_start_ids`` (the start-marker ids) mark per-image boundaries so two
-    images placed back-to-back stay distinct. Without it, adjacent blocks
-    ``[start][pad×N][end][start][pad×M][end]`` form one contiguous pad run and
-    collapse to a SINGLE placeholder while pixel_values still carries two images
-    -> vit-embed misalignment / shape mismatch. A start-marker always begins a
-    new kept placeholder even when it directly follows the previous end-marker.
-    """
-    ids = np.asarray(token_ids)
-    is_pad = np.isin(ids, list(pad_token_ids))
-    # Drop a pad token only when its predecessor is also pad (collapse the run),
-    # but never drop a start-marker: it opens a new image and must survive.
-    run_continues = is_pad[1:] & is_pad[:-1]
-    if image_start_ids:
-        run_continues &= ~np.isin(ids[1:], list(image_start_ids))
-    keep = np.ones(len(ids), dtype=bool)
-    keep[1:] &= ~run_continues
-    if placeholder_id is not None:
-        ids = np.where(is_pad, placeholder_id, ids)
-    return ids[keep].tolist()
 
 
 def accumulate_mm_inputs(existing: Optional[Dict], new: Optional[Dict]) -> Optional[Dict]:

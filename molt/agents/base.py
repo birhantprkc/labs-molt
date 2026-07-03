@@ -19,10 +19,12 @@ step-return tuple — used by both the per-step `Env.step()` and the one-shot
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 import torch
 
@@ -126,7 +128,7 @@ class Trajectory:
     scores: float = 0.0  # mirrors the dict key "scores" (plural for legacy reasons)
     truncated: bool = False
     extra_logs: dict = field(default_factory=dict)
-    group_id: str | None = None  # one per generate_responses() call; GRPO baseline averaging
+    group_id: str | None = None  # one per prompt group (N rollouts); GRPO baseline averaging
     rollout_id: str | None = None  # one per rollout; multi-turn step-samples dedup
 
     def append_action(self, action_tokens, action_logprobs=None, off_policy_len=0):
@@ -220,6 +222,14 @@ class Env(ABC):
 # (ChatAgentRunner). The trainer consumes the Trajectory dataclass directly.
 # ---------------------------------------------------------------------------
 class Runner(ABC):
+    # Does this runner want the dataset to hand it a chat-template-RENDERED prompt?
+    # StepEnvRunner does (it appends raw env-feedback tokens after a rendered first turn).
+    # ChatAgentRunner does NOT (it feeds RAW content to the chat server, which renders exactly
+    # once via the model's own template). The trainer reads this to auto-set
+    # --data.apply_chat_template, so a chat runner never double-renders (dropping the image on
+    # structured-content VLMs). Model-agnostic: keyed on the runner, never on the model.
+    PRERENDER_PROMPT = True
+
     @abstractmethod
     async def execute(
         self,
@@ -234,6 +244,25 @@ class Runner(ABC):
         raise NotImplementedError
 
 
+def load_agent_runner(agent_path: str) -> Runner:
+    """Import ``agent_path`` and instantiate its ``AgentRunner`` (a ``Runner``).
+
+    Loaded by the rollout driver/pool; the runner drives generation against the router,
+    so it is engine-independent.
+    """
+    assert agent_path and agent_path.endswith(".py"), "Agent path must be a Python file"
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("agent_module", agent_path)
+    agent_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent_module)
+
+    assert hasattr(agent_module, "AgentRunner"), "Agent module must contain AgentRunner class"
+    agent_runner_cls = agent_module.AgentRunner
+    assert issubclass(agent_runner_cls, Runner), "AgentRunner must inherit from Runner"
+    return agent_runner_cls()
+
+
 # ---------------------------------------------------------------------------
 # StepEnvRunner — drives an Env via step/reset. Owns the LLM generation loop,
 # tokenization, multimodal accounting, and per-turn budget enforcement.
@@ -246,11 +275,21 @@ class StepEnvRunner(Runner):
     async def execute(self, prompt, label, sampling_params, max_length, hf_tokenizer, llm_engine, images=None):
         sampling_params = deepcopy(sampling_params)
         env = self.env_cls()  # fresh env instance per episode
+        # One session id for the whole rollout: consistent_hash routes every turn (and each turn's
+        # render + generate) to ONE engine, so the multi-turn KV prefix stays warm and a VLM turn's
+        # render features resolve where it generates. Per-rollout, like vime/slime.
+        rollout_sid = uuid4().hex
 
         reset = await env.reset({"observation": prompt, "label": label})
         observation_text = reset["observation"]
 
-        obs_tokens, mm_train_inputs, pil_images = _tokenize_observation(hf_tokenizer, observation_text, images)
+        # process_prompt_with_images (inside _tokenize_observation) is a multi-second CPU op per image.
+        # run_group gathers n_samples rollouts on ONE actor event loop, so a synchronous tokenize
+        # blocks the loop and serializes the group (+ stalls the others' awaited generations). Run it
+        # in a thread so the loop stays free and rollouts overlap (mirrors the chat server).
+        obs_tokens, mm_train_inputs, pil_images = await asyncio.get_running_loop().run_in_executor(
+            None, _tokenize_observation, hf_tokenizer, observation_text, images
+        )
         image_budget = 0
         if pil_images:
             from molt.utils.vlm_utils import estimate_vllm_input_expansion_delta
@@ -303,11 +342,16 @@ class StepEnvRunner(Runner):
 
             mm_data = {"image": trajectory.pil_images} if trajectory.pil_images else None
             request_output, off_policy_len = await llm_engine.generate(
-                trajectory.observation_tokens, turn_sp, multi_modal_data=mm_data
+                trajectory.observation_tokens, turn_sp, multi_modal_data=mm_data, session_id=rollout_sid
             )
             generation = request_output.outputs[0]
             action_tokens = generation.token_ids
-            action_text = generation.text
+            # /inference/v1/generate is token-only (generation.text == ""); decode from the ids so
+            # Env.step sees the action text. skip_special_tokens=False keeps answer markers (<answer>,
+            # \boxed, tool tags) — matches observation_text decoding above.
+            action_text = generation.text or (
+                hf_tokenizer.decode(action_tokens, skip_special_tokens=False) if action_tokens else ""
+            )
             trajectory.truncated = trajectory.truncated or generation.finish_reason == "length"
 
             result: Result = await env.step(

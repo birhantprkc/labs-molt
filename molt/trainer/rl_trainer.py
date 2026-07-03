@@ -28,6 +28,22 @@ logger = init_logger(__name__)
 def prepare_datasets(strategy, tokenizer):
     args = strategy.args
 
+    # The CHAT runner feeds RAW content (the chat server renders it ONCE via the model's own template);
+    # the STEP runner needs a pre-rendered prompt. Auto-derive from the runner (Runner.PRERENDER_PROMPT)
+    # so the dataset never double-renders + drops the image on structured-content VLMs. Model-agnostic.
+    from molt.agents.base import load_agent_runner
+
+    if getattr(args.train, "agent_path", None) and not getattr(
+        load_agent_runner(args.train.agent_path), "PRERENDER_PROMPT", True
+    ):
+        if args.data.apply_chat_template:
+            logger.warning(
+                "chat runner feeds RAW content: forcing --data.apply_chat_template OFF. A pre-rendered "
+                "prompt would be double-templated by the chat server and drop the image on "
+                "structured-content VLMs (qwen3.6/kimi2.6/glm5.x/minimax/gemma4). Remove the flag for chat runners."
+            )
+        args.data.apply_chat_template = False
+
     # prepare datasets
     train_data = blending_datasets(
         args.data.prompt_dataset,
@@ -108,7 +124,7 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
             prompt_to_datasource[prompt] = datasource
 
     # Each Experience here is a single rollout sample (B=1). Group the per-sample
-    # scalars by the rollout group_id (one uuid per generate_responses call, i.e.
+    # scalars by the rollout group_id (one uuid per prompt group, i.e.
     # per eval prompt instance), NOT by the prompt STRING: two distinct eval rows
     # that render to the same string (same question across blended eval sets, dup
     # rows, or short templated prompts) would otherwise merge into one pass@k
@@ -506,25 +522,37 @@ class GenerateSamplesActor:
         self,
         pretrain,
         strategy,
-        vllm_engines,
         *,
         vllm_lock,
         rollout_queue,
         rollout_slots,
+        router_url=None,
         **generate_kwargs,
     ):
+        # No vllm_engines here: generation runs through the vllm-router via the runner
+        # actors below; only the TrainingActor touches the engines (pause/refit/resume).
         self.args = strategy.args
 
         tokenizer = get_tokenizer(pretrain, None, "left", use_fast=not strategy.args.data.disable_fast_tokenizer)
         self.prompts_dataloader, self.eval_dataloader, self.max_steps = prepare_datasets(strategy, tokenizer)
         self.generate_kwargs = generate_kwargs
 
+        # Rollout runs on a list of runner actors -> the shared vllm-router (generation),
+        # grading in-process. Weight sync goes straight to the engines (bypasses the router).
+        from molt.rollout.router import AgentRunnerActor
+
+        num_runners = max(1, getattr(strategy.args.rollout, "num_runners", 2))
+        agent_runners = [
+            AgentRunnerActor.remote(strategy.args.train.agent_path, router_url, model_path=pretrain)
+            for _ in range(num_runners)
+        ]
+        ray.get([r.ready.remote() for r in agent_runners])
         self.samples_generator = SamplesGenerator(
             strategy=strategy,
             prompts_dataloader=self.prompts_dataloader,
             eval_dataloader=self.eval_dataloader,
             tokenizer=tokenizer,
-            vllm_engines=vllm_engines,
+            agent_runners=agent_runners,
         )
 
         self.vllm_lock = vllm_lock
@@ -798,6 +826,7 @@ class RLTrainer:
         reference_model_group: RayActorGroup,
         vllm_engines,
         critic_model_group: RayActorGroup = None,
+        router_url: str = None,
         **generate_kwargs,
     ) -> None:
         if strategy.args.eval.steps == -1:
@@ -820,10 +849,10 @@ class RLTrainer:
         self.generator_actor = GenerateSamplesActor.remote(
             pretrain=pretrain,
             strategy=strategy,
-            vllm_engines=vllm_engines,
             vllm_lock=vllm_lock,
             rollout_queue=self.rollout_queue,
             rollout_slots=self.rollout_slots,
+            router_url=router_url,
             **generate_kwargs,
         )
 

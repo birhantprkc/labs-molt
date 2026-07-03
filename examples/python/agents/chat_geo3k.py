@@ -39,6 +39,11 @@ _PROJECT_DIR = Path(__file__).resolve().parent.parent
 _GRADER = _load_module("math_grader", _PROJECT_DIR / "utils" / "math_grader.py")
 _PYTHON_EXECUTOR = _load_module("python_executor", _PROJECT_DIR / "tools" / "python_executor.py").TOOL
 _TOOLS = {_PYTHON_EXECUTOR.schema["function"]["name"]: _PYTHON_EXECUTOR}
+# Sent on every chat call so the chat server renders the `# Tools` Hermes preamble into the
+# prompt (server forwards body["tools"] -> apply_chat_template(tools=...)). Without this the
+# chat path drops the tool schema entirely, diverging from the step-runner geo3k.py which gets
+# it from the dataset `tools` field via --data.apply_chat_template + --data.tools_key.
+_TOOL_SCHEMAS = [tool.schema for tool in _TOOLS.values()]
 
 _MAX_TURNS = int(os.environ.get("MAX_AGENT_TURNS", "5"))
 _ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL | re.IGNORECASE)
@@ -130,12 +135,11 @@ def _build_first_user_content(prompt_text: str, images) -> list | str:
 
 class Geo3kAgent(ChatAgent):
     async def run(self, ctx: ChatContext) -> Result:
-        # Retries ride out the transient loopback connection break when a weight
-        # broadcast briefly stalls the server's event loop. They're safe because
-        # the server serializes turns per session (a lock) and replays an
-        # already-committed turn idempotently, so a retry can't double-process.
-        # Generous timeout so slow cold-start generations don't fail outright.
-        client = AsyncOpenAI(base_url=ctx.base_url, api_key=ctx.api_key, max_retries=8, timeout=3600)
+        # Retries ride out a transient loopback stall (e.g. a weight broadcast briefly freezes the
+        # server's event loop). Safe: the server serializes turns per session (a lock) and replays
+        # an already-recorded turn idempotently (same messages -> cached reply, no second sample),
+        # so a retry can't double-count. Generous timeout so slow cold-start generations don't fail.
+        client = AsyncOpenAI(base_url=ctx.base_url, api_key=ctx.api_key, max_retries=3, timeout=3600)
         messages: list = [{"role": "user", "content": _build_first_user_content(ctx.prompt, ctx.images)}]
         assistant_history: list[str] = []
         tool_call_count = 0
@@ -147,6 +151,7 @@ class Geo3kAgent(ChatAgent):
                 messages=messages,
                 max_tokens=ctx.sampling_params.max_tokens,
                 temperature=ctx.sampling_params.temperature,
+                tools=_TOOL_SCHEMAS,
             )
             action = resp.choices[0].message.content or ""
             assistant_history.append(action)

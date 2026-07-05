@@ -372,7 +372,6 @@ RL_ARGS=(
   --vllm.gpu_memory_utilization "$VLLM_GPU_MEMORY_UTILIZATION"
   --vllm.mm_encoder_attn_backend "$VLLM_MM_ENCODER_ATTN_BACKEND"
   --vllm.gdn_prefill_backend "$VLLM_GDN_PREFILL_BACKEND"
-  --vllm.attention_backend "$VLLM_ATTENTION_BACKEND"
   --vllm.distributed_executor_backend "$VLLM_DISTRIBUTED_EXECUTOR_BACKEND"
   --fsdp.param_dtype bf16
   --fsdp.attn_implementation "$FSDP_ATTN_IMPLEMENTATION"
@@ -414,6 +413,10 @@ RL_ARGS+=(--train.agent_path "$AGENT_PATH")
 if [ "$VLLM_ENFORCE_EAGER" = "1" ]; then
   RL_ARGS+=(--vllm.enforce_eager)
 fi
+
+# Empty VLLM_ATTENTION_BACKEND = let vLLM auto-select (FA3/FlashInfer on Hopper);
+# only pass the flag when pinned (argparse rejects an empty --vllm.attention_backend).
+[ -n "$VLLM_ATTENTION_BACKEND" ] && RL_ARGS+=(--vllm.attention_backend "$VLLM_ATTENTION_BACKEND")
 
 if [ "$FORCE_ON_POLICY" = "1" ]; then
   RL_ARGS+=(--train.force_on_policy)

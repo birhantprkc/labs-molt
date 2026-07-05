@@ -12,19 +12,14 @@
 #SBATCH --exclusive
 
 # Nemotron Omni3 (NemotronH_Nano_Omni_Reasoning_V3) VLM SFT.
-# Default config = the validated 32K + CP8 + EP8 + deepep + AC stack (job 4679193,
-# 2026-06-07): the trainer delegates CP to the Actor (RL contract). 2 nodes (16
-# GPUs) → CP8 shards the 32K sequence to 4K/rank, DP=2.
-#
-# Omni3 specifics (mirror examples/scripts/slurm/rl_omni3.sh):
+# Default config = 32K + CP8 + EP8 + deepep + AC: the trainer delegates CP to the
+# Actor (RL contract); 2 nodes (16 GPUs) → CP8 shards the 32K sequence to 4K/rank,
+# DP=2. Mirrors slurm/rl_omni3_30b.sh:
 #   - Native AutoModel path (NemotronOmniForConditionalGeneration). TE is the
-#     intended fused-attention backend (native cuDNN-fused, NVTE default);
-#     flash_attention_2 silently falls to sdpa, and TE is *required* by
-#     capabilities.py for CP>1.
-#   - Gradient checkpointing ON by default: the deepep MoE dispatcher makes the
-#     recompute deterministic under AC (job 4679193 ran deepep+AC+32K+CP8 clean,
-#     no CheckpointError). The torch dispatcher does NOT — it triggers the
-#     CheckpointError, so AC requires deepep.
+#     fused-attention backend (flash_attention_2 silently falls to sdpa) and is
+#     required for CP>1.
+#   - Gradient checkpointing ON: the deepep MoE dispatcher makes the recompute
+#     deterministic under AC (the torch dispatcher raises CheckpointError).
 
 set -euo pipefail
 set -x

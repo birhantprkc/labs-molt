@@ -37,7 +37,7 @@ the trainer is a single actor; reward is any Python you write inside an `Env`
 or `ChatAgent` — graders, multi-turn tools, VLM environments, LLM-as-judge.
 Three components carry the rest — **Ray** for placement and async queues,
 **vLLM** for rollout, **NVIDIA AutoModel + FSDP2** for training in pure
-PyTorch. That is the whole stack: **under 9K lines of RL code that run
+PyTorch. That is the whole stack: **~8.2K lines of RL code that run
 700B-class MoE** (H200) on vLLM with TP / EP / CP — one agent API, one trainable
 actor, clean enough to read end-to-end. (Pipeline parallelism — and with it
 1T+ — lands once AutoModel's `AutoPipeline` interface is wired in.)
@@ -86,7 +86,7 @@ rollout.
 | ⚙️ **Fully-async runtime** | Ray placement, async rollout queues, vLLM engines, partial rollout, weight sync | Rollout, training, and weight sync overlap — a 700B actor stays fed without bespoke infra |
 | 🔥 **PyTorch-native, AutoModel-first** | FSDP2 + NVIDIA AutoModel, pure PyTorch end-to-end | Hack the model in the language you already write; no backend ceremony |
 | 🎯 **Single-actor simplicity** | One actor, optional KL reference — the whole RL graph fits on a page | Every gradient is explicit; every loss term is one file away |
-| 🚀 **700B-class out of the box (H200)** | AutoModel + FSDP2 + TP / EP / CP, MoE-native | Same script that works at 8B scales to 700B-class MoE on H200; **1T+ once AutoModel's pipeline-parallel (`AutoPipeline`) interface is added** |
+| 🚀 **700B-class out of the box (H200)** | AutoModel + FSDP2 + TP / EP / CP, MoE-native | The same script that trains 8B scales to 700B-class MoE on H200 — no rewrite between scales |
 | 🔗 **Token-first contract** | Aligned token ids, logprobs, action ranges, rewards, multimodal tensors | Multi-turn, VLM, and tool-call traces share one format end-to-end |
 | 🪶 **Small, hackable surface** | ~8.2K LOC of RL code across 3 thin layers | Fork one layer without touching the others — read it in an afternoon |
 
@@ -110,8 +110,7 @@ that still drives a 700B fully-async agentic RL run on vLLM (H200).
 
 **One framework, one job.** Molt is the smallest PyTorch-native
 stack that takes an NVIDIA AutoModel from SFT to 700B-class agentic RL on
-vLLM (H200; 1T+ once AutoModel's `AutoPipeline` PP interface is wired in).
-Read every line that touches your gradients, in plain PyTorch.
+vLLM (H200). Read every line that touches your gradients, in plain PyTorch.
 
 > ¹ RL code = every Python file the framework's RL path uses — online
 > trainer, rollout, Ray orchestration, experience/advantage/reward/KL/loss,
@@ -350,8 +349,8 @@ families ship today, both on the AutoModel + FSDP2 backend:
 
 | Workflow | quick_start | slurm |
 |---|---|---|
-| Qwen3.6-35B-A3B VLM SFT on geo3k | `quick_start/sft_qwen3_6.sh` | `slurm/sft_qwen3_6.sh` |
-| Qwen3.6-35B-A3B VLM RL on geo3k (multi-turn Python tool) | `quick_start/rl_qwen3_6.sh` | `slurm/rl_qwen3_6.sh` |
+| Qwen3.6-35B-A3B VLM SFT on geo3k | `quick_start/sft_qwen3_6_35b.sh` | `slurm/sft_qwen3_6_35b.sh` |
+| Qwen3.6-35B-A3B VLM RL on geo3k (multi-turn Python tool) | `quick_start/rl_qwen3_6_35b.sh` | `slurm/rl_qwen3_6_35b.sh` |
 | Qwen3-4B dense SFT on text math | `quick_start/sft_qwen3_4b.sh` | `slurm/sft_qwen3_4b.sh` |
 | Qwen3-4B dense RL on text math | `quick_start/rl_qwen3_4b.sh` | `slurm/rl_qwen3_4b.sh` |
 
@@ -365,13 +364,13 @@ Slurm usage:
 
 ```bash
 # 1) SFT smoke on interactive 2 nodes
-sbatch examples/scripts/slurm/sft_qwen3_6.sh
+sbatch examples/scripts/slurm/sft_qwen3_6_35b.sh
 
 # 2) RL smoke on interactive 2 nodes (auto-preps geo3k on first run)
-sbatch examples/scripts/slurm/rl_qwen3_6.sh
+sbatch examples/scripts/slurm/rl_qwen3_6_35b.sh
 
 # 3) Scale RL to 4 nodes for convergence
-sbatch --nodes=4 examples/scripts/slurm/rl_qwen3_6.sh
+sbatch --nodes=4 examples/scripts/slurm/rl_qwen3_6_35b.sh
 ```
 
 ### Multi-turn Python tool env
@@ -433,7 +432,7 @@ matches the teacher; task accuracy is not the objective, so eval is off.
 To distill a **multi-turn tool-use distribution** (matching how the student is
 actually deployed), point `--train.agent_path` at the task's real agent (e.g.
 `chat_geo3k.py`) — its reward is simply ignored by the estimator.
-`examples/scripts/slurm/rl_distill_omni3.sh` is a ready VLM example off the omni3
+`examples/scripts/slurm/rl_distill_omni3_30b.sh` is a ready VLM example off the omni3
 EP8 / CP8 / TE / DeepEP recipe.
 
 ## 🎛️ Scaling Knobs
@@ -449,6 +448,7 @@ Molt targets AutoModel custom models with FSDP2:
 | vLLM expert parallel | `--vllm.enable_expert_parallel` |
 | MTP rollout spec-decode | `--vllm.mtp_num_speculative_tokens 1` |
 | MoE router replay (R3) | `--train.routing_replay` |
+| MoE router freeze | `--actor.freeze_moe_router` |
 
 For CP training, packed RL batches are currently disabled. Packing is off by
 default, and CP rejects `--fsdp.packing_samples`.
@@ -481,16 +481,17 @@ Notes:
   unavailable until upstream adds it; vLLM errors at engine init if enabled on an
   unsupported checkpoint.
 
-### 🎯 Router Replay (R3)
+### 🎯 MoE routing stability — Router Replay (R3) & router freeze
 
 MoE RL is unstable because the rollout (vLLM) and training (FSDP) routers pick
 experts **independently** — even at identical weights, numerical differences
 flip a fraction of the top-k per layer, compounding until most tokens route to
 different experts than they did during rollout. That breaks the importance-
-sampling assumption behind GRPO/GSPO. **Rollout Routing Replay**
-([R3, arXiv:2510.11370](https://arxiv.org/abs/2510.11370)) fixes it at the
-source: vLLM returns the per-token expert ids it chose, and the training forward
-replays that exact selection. One flag:
+sampling assumption behind GRPO/GSPO. Molt ships two ways to close that gap:
+
+**1. Rollout Routing Replay (R3)** — fix it at the source
+([arXiv:2510.11370](https://arxiv.org/abs/2510.11370)): vLLM returns the per-token
+expert ids it chose, and the training forward replays that exact selection.
 
 ```bash
 --train.routing_replay   # off by default
@@ -506,6 +507,19 @@ replays that exact selection. One flag:
 - Needs AutoModel `RouterReplay` (`nemo_automodel.components.moe.router_replay`,
   PR #2797). Opt-in; incompatible with `--train.partial_rollout_enable` (vLLM
   frees routing on preemption).
+
+**2. Router freeze** — the blunter route: hold the gate/router weights fixed so the
+routing function can't drift between refits at all.
+
+```bash
+--actor.freeze_moe_router   # off by default
+```
+
+- Excludes the router from the optimizer (and the refit), so vLLM and the actor
+  route to the same experts **by construction** — no engine support needed.
+- The trade-off vs R3: the router stops learning. Prefer **router freeze** when
+  routing drift dominates the rollout-vs-train logprob gap and a fixed router is
+  acceptable; prefer **R3** when you want the router to keep training.
 
 ## ✅ Validation
 

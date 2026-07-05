@@ -2,9 +2,9 @@
 # Single-node quick-start: Qwen3.6-35B-A3B VLM SFT on geo3k.
 #
 # 8 GPUs on one machine via torchrun --standalone — no slurm.
-# Mirrors slurm/sft_qwen3_6.sh's recipe for single-node use.
+# Mirrors slurm/sft_qwen3_6_35b.sh's recipe for single-node use.
 #
-#   MODEL_PATH=/path/to/Qwen3.6-35B-A3B bash examples/scripts/quick_start/sft_qwen3_6.sh
+#   MODEL_PATH=/path/to/Qwen3.6-35B-A3B bash examples/scripts/quick_start/sft_qwen3_6_35b.sh
 
 set -euo pipefail
 

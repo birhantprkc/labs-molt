@@ -257,6 +257,7 @@ def create_vllm_engines(
     async_scheduling: Optional[bool] = None,
     decode_context_parallel_size: int = 1,
     dtype: str = "bfloat16",
+    block_size: Optional[int] = None,
     mtp_num_speculative_tokens: int = 0,
     enable_return_routed_experts: bool = False,
 ):
@@ -362,6 +363,13 @@ def create_vllm_engines(
             # backend must be passed via EngineArgs (e.g. "TRITON_ATTN" to
             # avoid AOT-compiled FlashAttention 2 PTX kernels on older drivers).
             actor_kwargs["attention_backend"] = attention_backend
+
+        if block_size:
+            # KV cache block size (tokens). MiniMax-M3's MSA sparse attention
+            # mandates a 128-token block; vLLM's default (16) leaves no common
+            # block size across M3's dense (layers 0-2) + sparse (3-59) attention
+            # and raises ValueError("No common block size for 16.") at KV setup.
+            actor_kwargs["block_size"] = block_size
 
         if mamba_ssm_cache_dtype:
             # Hybrid Mamba2 models (NemotronH / omni3): vLLM's NemotronH config

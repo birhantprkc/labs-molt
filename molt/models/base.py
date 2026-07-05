@@ -88,13 +88,10 @@ def _resolve_custom_backend_attn(attn_implementation: str, packing_samples: bool
 def _will_use_hf_model(pretrain_or_model, default: bool = True) -> bool:
     """True if this model would load through the plain HF transformers path.
 
-    BACKEND POLICY (see README): the AutoModel (NVIDIA-NeMo/Automodel) backend is
-    the primary, preferred path — native CP / EP / TP, the custom MoE+EP
-    parallelizer, TE fused attention, aligned with AutoModel's own recipes. The HF
-    path is a NON-PREFERRED fallback AutoModel drops to only when a model has no
-    registered native class (`get_is_hf_model(..., force_hf=False)` = "native if
-    available, else HF"). Here the HF fallback supports text + flash_attention_2 +
-    packing ONLY — NO CP / EP / TP. Prefer an AutoModel-native model class over it.
+    The AutoModel (NVIDIA-NeMo/Automodel) backend is the preferred path (native
+    CP/EP/TP, custom MoE+EP parallelizer, TE fused attention). HF is a fallback for
+    models with no registered native class and supports only text +
+    flash_attention_2 + packing (no CP/EP/TP).
     """
     if not isinstance(pretrain_or_model, str):
         return False
@@ -124,8 +121,7 @@ def _class_source_supports_thd_packing(model_cls) -> bool:
 
 def _automodel_arch_supports_thd_packing(pretrain_or_model) -> bool:
     """Return whether AutoModel's custom class consumes THD packing kwargs."""
-    # Only reached with a model-path string: the pre-instantiated branch in
-    # __init__ returns before this function's sole call site.
+    # Only reached with a model-path string (the pre-instantiated branch returns earlier).
     try:
         from nemo_automodel._transformers.registry import ModelRegistry
         from transformers import AutoConfig
@@ -134,7 +130,7 @@ def _automodel_arch_supports_thd_packing(pretrain_or_model) -> bool:
         archs = getattr(cfg, "architectures", None) or []
         if not archs:
             return False
-        # 015b0f621: model_arch_name_to_cls is a _LazyArchMapping (no .get()) — use contains/getitem.
+        # model_arch_name_to_cls is a _LazyArchMapping (no .get()) — use contains/getitem.
         _arch_map = ModelRegistry.model_arch_name_to_cls
         model_cls = _arch_map[archs[0]] if archs[0] in _arch_map else None
         return bool(model_cls) and _class_source_supports_thd_packing(model_cls)
@@ -172,10 +168,9 @@ def _normalize_output(output):
 def _first_token_id(config, *attr_names):
     """First integer token id among ``attr_names`` on the VLM config, else None.
 
-    VLM families name the media placeholder id differently: Qwen / Gemma use
-    ``image_token_id``, HF LLaVA / Mistral use ``image_token_index``, InternVL-style
-    use ``img_context_token_id``. Tested with ``isinstance(int)`` (not truthiness)
-    so a valid id of 0 is not skipped.
+    VLM families name the media placeholder id differently (image_token_id /
+    image_token_index / img_context_token_id). Uses ``isinstance(int)`` (not
+    truthiness) so a valid id of 0 is not skipped.
     """
     for name in attr_names:
         tid = getattr(config, name, None)
@@ -185,14 +180,13 @@ def _first_token_id(config, *attr_names):
 
 
 def _mtp_off_kwargs(pretrain_or_model) -> dict:
-    """The training actor never uses the multi-token-prediction (MTP) head (rollout
-    spec-decode loads its own copy inside vLLM). Return the ``from_pretrained``
-    config-override kwarg that disables it: AutoModel deep-merges nested config dicts
-    (``model_init._consume_config_overrides``), so passing ``text_config={...}`` patches
-    just that field of the loaded config — exactly the mechanism the official recipe yaml
-    uses (``text_config.mtp_num_hidden_layers: 0``). No filesystem mirror, no symlinks,
-    no read-only-store edge cases. Returns ``{}`` when MTP is absent or the path can't be
-    introspected (then loading proceeds unchanged)."""
+    """Return the ``from_pretrained`` config-override kwarg that disables the MTP head.
+
+    The training actor never uses the multi-token-prediction head (rollout spec-decode
+    loads its own copy in vLLM). AutoModel deep-merges nested config dicts, so
+    ``text_config={...}`` patches just that field (same mechanism as the recipe yaml's
+    ``text_config.mtp_num_hidden_layers: 0``). Returns ``{}`` when MTP is absent or the
+    path can't be introspected."""
     if not isinstance(pretrain_or_model, str):
         return {}
     try:
@@ -203,9 +197,12 @@ def _mtp_off_kwargs(pretrain_or_model) -> dict:
         return {}
     text_config = getattr(cfg, "text_config", None)
     target = text_config if text_config is not None else cfg
-    # Dense Qwen3.5 uses ``mtp_num_hidden_layers``; the MoE variant uses
-    # ``num_nextn_predict_layers`` — disable whichever is enabled.
-    disabled = {k: 0 for k in ("mtp_num_hidden_layers", "num_nextn_predict_layers") if getattr(target, k, 0)}
+    # MoE families name the MTP-depth config key differently (all keys tried below);
+    # disable whichever the config enables. Needed even when a checkpoint declares MTP
+    # modules but ships no MTP weights (building them would fail the weight load).
+    disabled = {
+        k: 0 for k in ("mtp_num_hidden_layers", "num_nextn_predict_layers", "num_mtp_modules") if getattr(target, k, 0)
+    }
     if not disabled:
         return {}
     return {"text_config": disabled} if text_config is not None else disabled
@@ -214,14 +211,11 @@ def _mtp_off_kwargs(pretrain_or_model) -> dict:
 class BaseModel(nn.Module):
     """Shared base for the RL model wrappers (``Actor`` and ``Critic``).
 
-    Owns everything the two share: building the underlying model via AutoModel's
-    official entry (``NeMoAutoModelForCausalLM.from_pretrained`` /
-    ``NeMoAutoModelForImageTextToText`` — loads HF weights, applies the
-    per-architecture TP plan, wraps with FSDP2 over ``device_mesh``, attaches CP
-    hooks if cp_size>1, optional activation checkpointing), plus the input prep +
-    model call (``_forward_backbone``) and the full-sequence restore. Subclasses
-    add only their head's ``forward``: ``Actor`` returns log-probs/entropy, ``Critic``
-    returns per-token values.
+    Owns what they share: building the model via AutoModel's ``from_pretrained``
+    (HF weights + per-arch TP plan + FSDP2 wrap + optional CP hooks / activation
+    checkpointing), the input prep + model call (``_forward_backbone``), and the
+    full-sequence restore. Subclasses add only their head's ``forward``: ``Actor``
+    returns log-probs/entropy, ``Critic`` per-token values.
     """
 
     def __init__(
@@ -286,12 +280,9 @@ class BaseModel(nn.Module):
         if is_moe and not ep_active:
             raise ValueError("MoE models require --fsdp.ep_size > 1 in the AutoModel custom-only branch.")
         use_hf_model = _will_use_hf_model(pretrain_or_model)
-        # Expert parallelism (EP) has no HF-transformers implementation — expert-parallel dispatch
-        # is a nemo_automodel custom-path feature. So if a checkpoint isn't natively registered
-        # (=> the HF fallback) AND EP is active, molt would silently mis-shard the MoE experts /
-        # train on wrong gradients. Forbid that combination outright and fail LOUDLY at launch.
-        # (TP and CP do NOT necessarily require the custom path — HF models can run under those —
-        # so they are not gated here, per nemo_automodel guidance.)
+        # EP dispatch is a nemo_automodel custom-path feature; HF has no equivalent. An
+        # HF-fallback model under active EP would silently mis-shard experts / train on
+        # wrong grads, so forbid it loudly. (TP/CP run on HF, so they aren't gated here.)
         if use_hf_model and ep_active:
             raise RuntimeError(
                 f"{pretrain_or_model!r}: architecture not in nemo_automodel's ModelRegistry, so molt "
@@ -306,10 +297,8 @@ class BaseModel(nn.Module):
                     "AutoModel custom implementation for this architecture does not consume THD packing kwargs; "
                     "use --fsdp.attn_implementation te with a THD-capable custom model or disable packing."
                 )
-            # HF fallback supports packing only via FA2's varlen kernel —
-            # pack_padded_batch emits cu_seq_lens kwargs the sdpa kernel
-            # ignores, which would silently fuse boundaries across packed
-            # rows. Catch the misconfig at init.
+            # HF packing works only with FA2's varlen kernel: sdpa ignores the
+            # cu_seq_lens kwargs and would silently fuse packed-row boundaries.
             if use_hf_model and (attn_implementation != "flash_attention_2" or not _has_hf_flash_attn_2()):
                 raise ValueError(
                     "HF model packing requires --fsdp.attn_implementation flash_attention_2 with flash-attn installed. "
@@ -317,13 +306,10 @@ class BaseModel(nn.Module):
                 )
 
         _validate_attn_implementation(attn_implementation)
-        # fp32 master weights, including for MoE. This matches AutoModel's
-        # fp32 master-weight precision contract (NVIDIA-NeMo/Automodel PR #2379)
-        # and NeMo-RL, which load every model in fp32 and let FSDP2's
-        # MixedPrecisionPolicy(param_dtype=bf16) do bf16 fwd/bwd. The previous
-        # is_moe->bf16 override saved memory but stored the master in bf16, so
-        # AdamW updates (~LR) fell below the bf16 weight ULP at small LR and
-        # rounded away — the MoE never actually learned.
+        # fp32 master weights (including MoE): matches AutoModel's master-weight
+        # contract (NVIDIA-NeMo/Automodel PR #2379) — load in fp32, let FSDP2's
+        # MixedPrecisionPolicy(param_dtype=bf16) do bf16 fwd/bwd. A bf16 master
+        # rounds away AdamW updates (~LR < bf16 ULP) at small LR, so the MoE never learns.
         torch_dtype = compute_dtype if not use_fp32_master_weights else torch.float32
         self.is_vlm = is_vlm_model(pretrain_or_model)
 
@@ -332,16 +318,10 @@ class BaseModel(nn.Module):
         else:
             from nemo_automodel import NeMoAutoModelForCausalLM as ModelCls
 
-        # Attention selection is owned by AutoModel, not second-guessed here.
-        # On the HF path AutoModel's _apply_preload_overrides forces sdpa under
-        # CP and _get_next_fallback_attn retries flash_attention_2 -> sdpa when a
-        # model lacks FA2 support (the official qwen3_5 dense recipe uses sdpa).
-        # The HF packing+FA2 prerequisite is already enforced above (use_hf_model).
-        # Auto-fallback: when AutoModel has no custom path (e.g. dense Qwen3-8B),
-        # use HF transformers directly. MoE-specific features (custom EP
-        # parallelizer, CP linear-attn) are unavailable on the HF path — fine for
-        # dense models, which lack them anyway. Log once so RL users on MoE models
-        # notice if their checkpoint silently degrades.
+        # AutoModel owns attention selection (forces sdpa under CP, falls back
+        # FA2->sdpa when a model lacks FA2). When no custom path matches (e.g. dense
+        # Qwen3-8B) it uses HF transformers directly — fine for dense models, which
+        # lack the MoE/EP/CP features anyway. Log once so MoE users notice a silent degrade.
         if use_hf_model and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
             print(
                 f"[AutoModel] WARNING: no native AutoModel implementation matched {pretrain_or_model!r} "
@@ -351,18 +331,15 @@ class BaseModel(nn.Module):
                 "silently degrade throughput AND break activation-checkpoint recompute determinism. "
                 "Verify this checkpoint's `architectures` is registered if you expected the native path."
             )
-        # Keep AutoModel custom forwards in the compute dtype when master
-        # weights are fp32, so lm_head/score inputs match bf16 parameters.
-        # MoE now also has fp32 master (see above), so it takes this path too.
+        # With fp32 master weights, autocast the forward to the compute dtype so
+        # lm_head/score inputs match the bf16 parameters.
         if compute_dtype != torch.float32:
             self._forward_autocast_dtype = compute_dtype
 
-        # Build the from_pretrained kwargs. The only structural difference
-        # between the AutoModel custom and HF paths: AutoModel custom needs
-        # a BackendConfig (its real attention/MoE backend selector) and
-        # forces attn_implementation="sdpa" on the HF config side. HF's
-        # from_pretrained rejects unknown kwargs, so we omit `backend` there
-        # and pass attn_implementation through unchanged.
+        # AutoModel custom drives attention/MoE through a BackendConfig and hands
+        # from_pretrained "sdpa": passing "te" would also fire AutoModel's own post-init
+        # TE injection (auto_model.py) on top of the backend's. HF rejects the `backend`
+        # kwarg, so we omit it there and pass attn_implementation through unchanged.
         attn_for_from_pretrained = attn_implementation
         backend_kwarg: dict = {}
         if not use_hf_model:
@@ -373,42 +350,47 @@ class BaseModel(nn.Module):
             # Qwen3.5-MoE CP mixes mRoPE position tensors with local sequence
             # shards; TE fused RoPE expects the simpler 4D rotary layout.
             backend_cfg = {"attn": backend_attn, "rope_fusion": using_te and self.cp_size <= 1}
-            # Pin the MoE token dispatcher explicitly (BackendConfig otherwise
-            # auto-selects based on whether deep_ep is importable, which would
-            # silently change the training path just by virtue of the package
-            # being installed). Default to the DeepEP fused dispatcher: it makes
-            # the MoE recompute deterministic under activation checkpointing
-            # (validated omni3 SFT, jobs 4679193/4679410/4684045) and, paired
-            # with the multi-root grad-sync fix in FsdpStrategy, gives correct
-            # RL grads. Override with MOLT_MOE_DISPATCHER=torch for the
-            # legacy DTensor path.
+            # Pin the MoE dispatcher (BackendConfig otherwise auto-selects on deep_ep
+            # importability, silently changing the training path). Default deepep: makes
+            # MoE recompute deterministic under activation checkpointing and gives correct
+            # RL grads (with the FsdpStrategy grad-sync fix). Override: MOLT_MOE_DISPATCHER.
             backend_cfg["dispatcher"] = os.environ.get("MOLT_MOE_DISPATCHER", "deepep")
-            if not using_te:
+            # Linear (GEMM) + experts backend follow the attention choice by default
+            # (TE attn -> TE linear/experts, else torch). Some models decouple them
+            # (e.g. sparse-attn arch needs sdpa but wants TE linear + gmm experts), so
+            # MOLT_LINEAR_BACKEND / MOLT_MOE_EXPERTS override the attn-coupled default.
+            linear_backend = os.environ.get("MOLT_LINEAR_BACKEND")
+            experts_backend = os.environ.get("MOLT_MOE_EXPERTS")
+            if linear_backend:
+                backend_cfg["linear"] = linear_backend
+            elif not using_te:
                 backend_cfg["linear"] = "torch"
+            if experts_backend:
+                backend_cfg["experts"] = experts_backend
+            elif not using_te:
                 backend_cfg["experts"] = "torch_mm"
-            # RMS-norm precision. A bf16 RMSNorm can recompute non-deterministically
-            # under activation checkpointing (-> CheckpointError) and destabilize the
-            # MoE grad norm. Default to "torch_fp32" (fp32 RMSNorm) — the setting the
-            # AutoModel omni / Qwen3.5-MoE reference recipes ship. Override via
-            # MOLT_RMS_NORM (e.g. =torch for the old bf16 behavior).
+            # RMS-norm precision. bf16 RMSNorm recomputes non-deterministically under
+            # activation checkpointing (-> CheckpointError) and destabilizes the MoE grad
+            # norm. Default fp32 (matches AutoModel reference recipes). Override: MOLT_RMS_NORM.
             backend_cfg["rms_norm"] = os.environ.get("MOLT_RMS_NORM", "torch_fp32")
+            # Force the MoE router to fp32 (BackendConfig defaults the gate linear to
+            # the bf16 bulk dtype). A bf16 router drifts from vLLM's fp32 router ->
+            # rollout-vs-train logprobs diverge and vllm_kl climbs. Matches slime/verl.
+            # Override: MOLT_GATE_PRECISION.
+            backend_cfg["gate_precision"] = os.environ.get("MOLT_GATE_PRECISION", "float32")
             attn_for_from_pretrained = "sdpa"
             backend_kwarg = {"backend": BackendConfig(**backend_cfg)}
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 print(f"[Attn] AutoModel custom backend={backend_attn}; config attn_implementation=sdpa.")
 
-        # 015b0f621 replaced the separate device_mesh/moe_mesh/distributed_config/
-        # moe_config/activation_checkpointing kwargs with a single DistributedSetup
-        # (mesh_context + policies). Wrap our pre-built meshes via MeshContext.from_meshes.
+        # AutoModel bundles device_mesh/moe_mesh/distributed_config/moe_config/AC into
+        # a single DistributedSetup; wrap our pre-built meshes via MeshContext.from_meshes.
         from nemo_automodel.components.distributed.config import DistributedSetup
         from nemo_automodel.components.distributed.mesh import MeshContext
 
-        # `activation_checkpointing` is the gradient_checkpoint CLI value
-        # (str | bool: "full" | "selective" | "none" | ...). Default "full"
-        # matches every AutoModel MoE/deepep recipe (nemotron_nano_v3_te_deepep,
-        # qwen3.5_moe_te_deepep, qwen3_6_35b_ep8cp2, deepseek_v3_te_deepep, ...);
-        # no shipped recipe uses "selective" (it appears only in unit tests).
-        # Pass "selective" for TorchTitan per-op AC.
+        # `activation_checkpointing` is the gradient_checkpoint CLI value (str | bool).
+        # Default "full" matches AutoModel's MoE/deepep recipes; pass "selective" for
+        # TorchTitan per-op AC.
         ac_setting = resolve_ac_mode(activation_checkpointing)
         dist_setup = DistributedSetup(
             mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
@@ -425,46 +407,32 @@ class BaseModel(nn.Module):
             use_liger_kernel=False,
             has_packed_sequence=packing_samples,
             force_hf=False,
-            # The training actor never uses the multi-token-prediction head; disable
-            # it via AutoModel's config-override deep-merge (same mechanism as the
-            # recipe yaml). No-op without MTP. Replaces the old symlinked ``-nomtp``
-            # mirror dir. (Rollout spec-decode loads its own MTP copy inside vLLM.)
+            # Disable the MTP head via AutoModel's config-override deep-merge (see
+            # _mtp_off_kwargs); no-op without MTP.
             **_mtp_off_kwargs(pretrain_or_model),
             **backend_kwarg,
         )
         self.model = move_model_to_cpu_for_offload(self.model, distributed_config)
-        # AutoModel's from_pretrained may downgrade to HF even when we asked
-        # for custom (rare; usually trust_remote_code path). Re-derive from
-        # the loaded class so the forward path picks the right pack style.
+        # from_pretrained may downgrade to HF even when custom was requested;
+        # re-derive from the loaded class so the forward picks the right pack style.
         self._packing_style = "automodel" if is_automodel_custom_model(self.model) else "hf"
         configure_nemo_moe_aux_loss(self.model, moe_aux_loss_coef)
         if routing_replay:
             # R3: give every MoE gate a RouterReplay handle so the training forward
-            # can replay the rollout's expert selection. Done post from_pretrained
-            # (not via MoEConfig) so it stays model-agnostic.
-            #
-            # vLLM captures routing into a [num_hidden_layers, topk] buffer indexed by
-            # the GLOBAL decoder-layer id (non-MoE rows stay zero). For a hybrid model
-            # (omni3: Mamba/attention/MoE interleaved) the MoE gates sit at sparse
-            # global layer ids, so each gate must replay against its own global-id row
-            # -- not the i-th row. We read that id from the module path (`...layers.7...`);
-            # uniform-MoE models (qwen3.6) parse to 0..N-1, so selection is a no-op there.
+            # replays the rollout's expert selection. Done post from_pretrained (not via
+            # MoEConfig) to stay model-agnostic. vLLM indexes its routing buffer by GLOBAL
+            # decoder-layer id, so each gate replays against its own global-id row (read
+            # from the module path); uniform-MoE models parse to 0..N-1 (no-op reorder).
             import re
 
             from nemo_automodel.components.moe.router_replay import RouterReplay
 
-            # molt's _build_routing_targets marks positions with no captured rollout
-            # routing (a multimodal prompt the engine didn't route, feedback, CP pad)
-            # with a -1 sentinel meaning "keep the live selection here". Stock
-            # RouterReplay.apply() returns the target verbatim in REPLAY mode, so -1
-            # reaches the expert gather (torch.gather forbids negative indices) -> a
-            # device-side assert (crashed distill step-1, job 5023211, on the baked
-            # automodel). super().apply() still records / replays / shape-checks; we only
-            # keep the live selection at the sentinels. Outside REPLAY, super() returns the
-            # live indices (all >= 0), so the where is a plain no-op -- no mode check needed.
-            # Mirrors the upstream where-guard entirely in molt: R3 runs on a baked automodel
-            # with no source patch / external worktree, and it no-ops once automodel upstreams
-            # the same guard (result then already carries no -1).
+            # _build_routing_targets marks positions with no captured routing with a -1
+            # sentinel ("keep the live selection"). Stock RouterReplay returns the target
+            # verbatim, so -1 reaches the expert gather (torch.gather forbids negative
+            # indices) -> device-side assert. Keep the live selection at the sentinels;
+            # outside REPLAY super() returns live indices (>=0), so the where is a no-op.
+            # No-ops once AutoModel upstreams the same where-guard.
             class _SentinelRouterReplay(RouterReplay):
                 def apply(self, indices: torch.Tensor) -> torch.Tensor:
                     result = super().apply(indices)
@@ -488,17 +456,13 @@ class BaseModel(nn.Module):
         if self.packing_samples:
             print("[Packing] Using AutoModel THD/TE packed path.")
 
-        # VLM: optionally freeze the vision encoder so only the language
-        # model backbone is trained. Both Qwen3.5 and Gemma4 place language
-        # params under "language_model.*" / "lm_head.*"; everything else
-        # (visual encoder, projector) gets frozen.
+        # VLM: optionally freeze the vision encoder so only the language backbone
+        # trains (language params live under "language_model.*" / "lm_head.*").
         #
-        # CP>1 forces freezing: PyTorch's CP attention runs `buffer.resize_`
-        # on the sharded inputs_embeds and rejects `requires_grad=True`
-        # tensors. The CP forward already wraps `_pre_embed_only=True` in
-        # `torch.no_grad()` so no gradient reaches the vision tower anyway —
-        # we promote the flag here to keep optimizer state from holding
-        # vision params that will never receive a gradient.
+        # CP>1 forces freezing: PyTorch CP attention runs `resize_` on the sharded
+        # inputs_embeds and rejects requires_grad=True. The pre-embed already runs
+        # under no_grad, so no gradient reaches the vision tower anyway; freezing
+        # just keeps optimizer state from holding never-updated vision params.
         effective_freeze_visual = freeze_visual_encoder
         if self.is_vlm and self.cp_size > 1 and not freeze_visual_encoder:
             effective_freeze_visual = True
@@ -512,13 +476,10 @@ class BaseModel(nn.Module):
                 if "language_model" not in name and "lm_head" not in name:
                     param.requires_grad = False
 
-        # Optionally freeze the MoE router/gate so its weights stay fixed during training, which
-        # stabilizes MoE training and keeps the vLLM-vs-actor routing identical. Match by
-        # isinstance(Gate), NOT by name: the router linear is `Gate.weight` but its path varies by
-        # arch (omni3/NemotronV3 nests it under `mixer.gate`, other MoE families under `mlp.gate`)
-        # and a `gate` name match would also catch the gated-MLP `gate_proj.weight`, which is NOT a
-        # router. requires_grad=False excludes it from the optimizer and (for VLMs) the refit, so
-        # the router stays fixed on both the actor and vLLM.
+        # Optionally freeze the MoE router/gate (keeps vLLM-vs-actor routing identical,
+        # stabilizes training). Match by isinstance(Gate), NOT by name: the path varies by
+        # arch and a `gate` name match would also catch the gated-MLP `gate_proj.weight`,
+        # which is not a router. requires_grad=False drops it from the optimizer and refit.
         if freeze_moe_router:
             try:
                 from nemo_automodel.components.moe.layers import Gate
@@ -540,9 +501,8 @@ class BaseModel(nn.Module):
 
         if self.is_vlm:
             self._vlm_config = self.model.config
-            # Resolve once at construction so forward() doesn't redo the
-            # attribute-fallback dance on every microbatch. Field names vary
-            # across VLM families (see _first_token_id).
+            # Resolve once at construction so forward() doesn't redo the attribute
+            # fallback per microbatch (field names vary across VLM families).
             self._image_token_id = _first_token_id(
                 self._vlm_config, "image_token_id", "image_token_index", "img_context_token_id"
             )
@@ -567,30 +527,22 @@ class BaseModel(nn.Module):
     def _build_routing_targets(self, routed_experts, indices, cp_forward):
         """Shard the R3 routing ids to this rank's forward token order (RouterReplay).
 
-        ``routed_experts`` is ``(B, vllm_layers, topk, S)`` — the rollout router's
-        top-k expert ids per token, seq last. Returns one ``(num_tokens, topk)`` long
-        tensor per MoE gate (layer order), reordered to exactly what the gate sees on
-        this rank: CP load-balanced under cp>1, packed (pad removed) under sample
-        packing, or the plain padded ``B*S`` order otherwise.
+        ``routed_experts`` is ``(B, vllm_layers, topk, S)`` (rollout top-k expert ids per
+        token, seq last). Returns one ``(num_tokens, topk)`` tensor per MoE gate, reordered
+        to what the gate sees on this rank (CP-local under cp>1, pad-removed under packing,
+        else plain ``B*S``). Positions with no captured routing carry a -1 sentinel that
+        ``RouterReplay`` keeps at the live selection.
 
-        Positions with no captured rollout routing (a multimodal prompt the engine did
-        not route, feedback, CP pad) carry a -1 sentinel; ``RouterReplay`` keeps the
-        live (natural) selection there and replays only the captured rows.
-
-        vLLM sizes the layer dim to num_hidden_layers and indexes it by the GLOBAL
-        decoder-layer id (omni3: 52 rows, MoE gates sparse among them; non-MoE rows
-        are zero). So we pick each gate's own global-id row (``_moe_layer_global_ids``,
-        set at attach time) rather than the first ``n_gates`` rows. For a uniform-MoE
-        model (qwen3.6) the ids are 0..N-1, so this reduces to the plain layer order.
+        vLLM indexes its layer dim by GLOBAL decoder-layer id, so we pick each gate's own
+        global-id row (``_moe_layer_global_ids``); uniform-MoE ids are 0..N-1 (plain order).
         """
         n_gates = self._num_routing_gates
         global_ids = self._moe_layer_global_ids
         routing = routed_experts  # (B, vllm_layers, topk, S), seq last
         if cp_forward:
-            # Take this rank's CP shard. Pad the seq dim as the forward did — with the -1
-            # "keep live routing" sentinel, so CP pad tokens aren't force-routed to expert
-            # 0 — then gather the head+tail chunks this rank holds. Local length is the
-            # padded length / cp_size, derived from `routing` here (NOT the post-shard len).
+            # Take this rank's CP shard: pad the seq dim as the forward did, with the -1
+            # sentinel (so CP pad tokens aren't force-routed to expert 0), then gather this
+            # rank's chunks. Local length = padded / cp_size, from `routing` (pre-shard).
             routing = pad_to_cp_multiple(routing, self.cp_size, seq_dim=3, value=-1)
             local_positions = cp_local_seq_index(routing.shape[3] // self.cp_size, self.cp_mesh, routing.device)
             routing = routing.index_select(3, local_positions)
@@ -655,10 +607,8 @@ class BaseModel(nn.Module):
                     token_type_ids = (sequences == image_token_id).to(torch.int32)
                     if video_token_id is not None:
                         token_type_ids[sequences == video_token_id] = 2
-                    # Detect silent vision drop: if pixel_values is in mm_inputs
-                    # but no image-context tokens are present in the input_ids,
-                    # the LM forward will produce text-only logits while the
-                    # rollout used vision — silent train/rollout policy mismatch.
+                    # Detect silent vision drop: pixel_values present but no image-context
+                    # tokens -> text-only logits while the rollout used vision (policy mismatch).
                     if "pixel_values" in mm_inputs and not getattr(self, "_warned_no_image_tokens", False):
                         n_img = int(token_type_ids.eq(1).sum().item())
                         if n_img == 0:
@@ -684,19 +634,15 @@ class BaseModel(nn.Module):
                 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 
                 # VLM + CP: the vision tower must run before CP shards the sequence,
-                # which AutoModel supports only via its per-model pre-embed hook
-                # (`prepare_model_inputs_for_cp`; omni3/step3p7 — NVIDIA-NeMo/Automodel#2125).
-                # qwen3.5-moe has no such hook and AutoModel does not support its VLM+CP,
-                # so qwen3.6 VLM runs at cp=1 with TP/EP for memory (see rl_qwen3_6.sh).
-                # Hooked models pre-embed here via `_pre_embed_only`; `torch.no_grad()`
-                # keeps the embeds grad-free (PyTorch CP resize_s the sharded buffer).
+                # which AutoModel supports only via its pre-embed hook
+                # (`prepare_model_inputs_for_cp` — NVIDIA-NeMo/Automodel#2125). Models
+                # without the hook run at cp=1 (use TP/EP for memory). Pre-embed here via
+                # `_pre_embed_only` under no_grad (PyTorch CP resize_s the sharded buffer).
                 #
-                # Pre-embed UNCONDITIONALLY under VLM+CP (do not gate on `mm_inputs`): the
-                # pre-embed fires an FSDP all-gather of embed_tokens over the dp_cp group, so
-                # gating it on whether this rank's microbatch had images let image-free ranks
-                # skip the all-gather while image-bearing ranks ran it -> divergent collective
-                # -> NCCL deadlock. A text-only microbatch just embeds its tokens (numerically
-                # identical to the normal forward), keeping every dp_cp rank in lockstep.
+                # Pre-embed UNCONDITIONALLY (do not gate on `mm_inputs`): it fires an FSDP
+                # all-gather over the dp_cp group, so gating on per-rank images would let
+                # image-free ranks skip it -> divergent collective -> NCCL deadlock. A
+                # text-only microbatch just embeds its tokens, keeping ranks in lockstep.
                 if getattr(self, "is_vlm", False):
                     if not hasattr(self.model, "prepare_model_inputs_for_cp"):
                         raise RuntimeError(
@@ -704,12 +650,10 @@ class BaseModel(nn.Module):
                             "(prepare_model_inputs_for_cp); this model lacks it — run with "
                             "cp_size=1 (use TP/EP for memory)."
                         )
-                    # Fail fast on image-placeholder tokens with NO multimodal inputs: the rollout
-                    # dropped the image, so prepare_model_inputs_for_cp -> get_rope_index would hit
-                    # image_grid_thw=None and crash cryptically ("'NoneType' is not an iterator").
-                    # A structured-content VLM (Qwen3-VL) renders <image> to a model placeholder, so a
-                    # chat agent that attaches images only at a literal <image> marker attaches none.
-                    # omni3-safe: its image microbatch always has non-empty mm_inputs (pixel_values).
+                    # Fail fast when image-placeholder tokens are present but mm_inputs is empty
+                    # (rollout dropped the image): get_rope_index would hit image_grid_thw=None
+                    # and crash cryptically. Likely cause: a chat agent attaching images only at
+                    # a literal <image> marker that a structured-content VLM already rendered away.
                     if not mm_inputs and self._image_token_id is not None:
                         n_img = int((sequences == self._image_token_id).sum().item())
                         if n_img:
@@ -726,10 +670,9 @@ class BaseModel(nn.Module):
                         ]
                     mm_inputs = {}
 
-                # Pad to Automodel/PyTorch CP's 2 * cp_size divisor before
-                # make_cp_batch_and_ctx injects position_ids. This preserves a
-                # dense arange over the padded sequence and keeps shifted-token
-                # gather targets valid in the pad tail.
+                # Pad to CP's 2*cp_size divisor before make_cp_batch_and_ctx injects
+                # position_ids, so the arange stays dense and shifted-token gather
+                # targets stay valid in the pad tail.
                 sequences = pad_to_cp_multiple(sequences, self.cp_size, seq_dim=1, value=0)
                 attention_mask = pad_to_cp_multiple(attention_mask, self.cp_size, seq_dim=1, value=0)
                 rolled_sequences = pad_to_cp_multiple(rolled_sequences, self.cp_size, seq_dim=1, value=0)
@@ -767,32 +710,27 @@ class BaseModel(nn.Module):
             cp_context_stack.enter_context(forward_ctx)
             forward_ctx = nullcontext()
 
-        # R3: replay the rollout's per-token expert selection so the training
-        # router picks the same experts (kills train/rollout routing drift). The
-        # ids are sharded to match this rank's packed / CP-local token order.
+        # R3: replay the rollout's per-token expert selection so the training router
+        # picks the same experts (kills routing drift). Ids sharded to this rank's order.
         replay_ctx = nullcontext()
         if routed_experts is not None:
             from nemo_automodel.components.moe.router_replay import RouterReplay
 
             replay_ctx = RouterReplay.replay(self._build_routing_targets(routed_experts, indices, cp_forward))
-            # R3 replay must stay active through the activation-checkpoint recompute in
-            # backward — otherwise the recompute reverts to the live router and disagrees
-            # with the replayed forward (CheckpointError: recomputed metadata differs).
-            # Keep it on the caller's stack (closed after backward), like the CP context
-            # above. The no-grad old-logprob recompute passes no stack -> forward-only.
+            # Replay must stay active through the activation-checkpoint recompute in
+            # backward, else the recompute reverts to the live router and disagrees with
+            # the replayed forward (CheckpointError). Keep it on the caller's stack; the
+            # no-grad old-logprob recompute passes no stack -> forward-only.
             if cp_context_stack is not None:
                 cp_context_stack.enter_context(replay_ctx)
                 replay_ctx = nullcontext()
 
         with forward_ctx:
             with autocast_ctx:
-                # Always pass sequences as the keyword `input_ids`. Some VLM
-                # forwards declare `pixel_values` as the first positional, so
-                # a bare positional `sequences` would collide with `pixel_values`
-                # in mm_inputs. In the pre-embed CP path (post-PR-2125) we pass
-                # inputs_embeds directly — the model auto-detects
-                # `_embeds_pre_built` from the presence of inputs_embeds and
-                # skips multimodal scatter.
+                # Always pass sequences as keyword `input_ids`: some VLM forwards
+                # declare `pixel_values` first positional, so a bare positional would
+                # collide with it. In the pre-embed CP path we pass inputs_embeds
+                # directly (the model auto-detects it and skips multimodal scatter).
                 forward_kwargs = dict(
                     attention_mask=forward_attention_mask,
                     position_ids=position_ids,

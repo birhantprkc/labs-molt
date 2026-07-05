@@ -109,7 +109,7 @@ if [ "$CHAIN_DEPTH" -lt "$CHAIN_MAX" ]; then
     --qos="$SLURM_JOB_QOS" \
     ${SLURM_JOB_RESERVATION:+--reservation="$SLURM_JOB_RESERVATION"} \
     --nodes="$SLURM_JOB_NUM_NODES" \
-    "$REPO_ROOT/examples/scripts/slurm/rl_distill_omni3.sh")
+    "$REPO_ROOT/examples/scripts/slurm/rl_distill_omni3_30b.sh")
   echo "[chain] depth=$NEXT_DEPTH/$CHAIN_MAX next_jobid=$next_jobid"
 fi
 

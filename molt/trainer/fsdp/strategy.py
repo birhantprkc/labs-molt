@@ -34,13 +34,10 @@ def _get_actor_cls():
 class FsdpStrategy:
     """FSDP2 + TP/CP/SP/EP backend using NeMo AutoModel.
 
-    Mirrors DeepspeedStrategy's public surface so trainers are agnostic to the
-    backend. The model is built and parallelized via AutoModel's official
-    entry point ``NeMoAutoModelForCausalLM.from_pretrained`` inside ``Actor``;
-    this strategy only handles distributed setup, optimizer/scheduler
-    construction, the train-step (loss backward, grad clip, optimizer step),
-    collectives, and checkpointing. Grad norm / clip are imported directly
-    from ``nemo_automodel.components.distributed.grad_utils``.
+    Mirrors DeepspeedStrategy's public surface so trainers stay backend-agnostic.
+    The model is built/parallelized via ``NeMoAutoModelForCausalLM.from_pretrained``
+    inside ``Actor``; this strategy handles distributed setup, optimizer/scheduler
+    construction, the train-step, collectives, and checkpointing.
     """
 
     def __init__(
@@ -65,20 +62,16 @@ class FsdpStrategy:
         self.ep_size = getattr(fsdp, "ep_size", 1)
         self.pp_size = getattr(fsdp, "pp_size", 1)
         self.param_dtype = getattr(fsdp, "param_dtype", "bf16")
-        # CPU-offload level (--fsdp.offload): none / optimizer / full. A nested
-        # progression, not orthogonal — 'full' (FSDP2 CPUOffloadPolicy) streams params to
-        # CPU and the optimizer follows; 'optimizer' keeps params on GPU and runs only the
-        # AdamW step on CPU (MoE-safe; see optimizer_offload.py). So a single level picks
-        # at most one, and there is nothing to exclude.
+        # CPU-offload level (--fsdp.offload): none / optimizer / full. 'full' (FSDP2
+        # CPUOffloadPolicy) streams params to CPU and the optimizer follows;
+        # 'optimizer' keeps params on GPU and runs only the AdamW step on CPU
+        # (MoE-safe; see optimizer_offload.py).
         offload = getattr(fsdp, "offload", "none")
         self.cpu_offload = offload == "full"
         self.offload_optimizer = offload == "optimizer"
-        # The 'optimizer' level runs the AdamW step on CPU (params stay on GPU); see
-        # molt/trainer/fsdp/optimizer_offload.py. 'full' is FSDP2 CPUOffloadPolicy below.
         self._optimizer_offloader = CpuOptimizerOffloader() if self.offload_optimizer else None
-        # SP is OFF by default (opt in via --fsdp.sequence_parallel) — matches the
-        # AutoModel omni / Qwen3.5-MoE recipes, and avoids the _NormPartial 2D
-        # TP+FSDP weight-load hang on the HF-fallback path.
+        # SP off by default (opt in via --fsdp.sequence_parallel); avoids the
+        # _NormPartial 2D TP+FSDP weight-load hang on the HF-fallback path.
         self.sequence_parallel = bool(getattr(fsdp, "sequence_parallel", False))
 
         self.world_size: int = 1
@@ -90,14 +83,13 @@ class FsdpStrategy:
         self._last_grad_norm: float = 0.0
         self.time_steps = defaultdict(int)
         self._max_norm_by_optimizer = {}
-        # On-disk checkpoint I/O (save/load/HF-export) lives in its own subsystem;
-        # the public save_model/save_ckpt/load_ckpt methods below delegate to it.
+        # On-disk checkpoint I/O lives in CheckpointManager; the save_*/load_*
+        # methods below delegate to it.
         self.checkpoint = CheckpointManager(self)
 
-    # ProcessGroup / DeviceMesh aren't picklable. `datasets.map(self.process_data,
-    # num_proc>1)` indirectly pickles the strategy via the dataset's bound method;
-    # drop the distributed handles so the workers spawn cleanly. Workers don't need
-    # them; they only run pure-CPU data preprocessing.
+    # ProcessGroup / DeviceMesh aren't picklable, but `datasets.map(num_proc>1)`
+    # pickles the strategy via the bound method. Drop the distributed handles for
+    # the CPU-only preprocessing workers, which don't need them.
     _UNPICKLABLE_ATTRS = ("device_mesh", "moe_mesh", "distributed_config")
 
     def __getstate__(self):
@@ -177,8 +169,6 @@ class FsdpStrategy:
         if self.pp_size > 1:
             raise NotImplementedError("Molt trainers are not pipeline-parallel aware yet; set --fsdp.pp_size 1")
 
-        # 015b0f621 moved MoEParallelizerConfig moe.config -> distributed.config
-        # (same fields: mp_policy, ignore_router_for_ac).
         from nemo_automodel.components.distributed.config import FSDP2Config, MoEParallelizerConfig
         from nemo_automodel.components.distributed.mesh import ParallelismSizes
         from nemo_automodel.components.distributed.mesh_utils import _create_device_meshes
@@ -201,10 +191,9 @@ class FsdpStrategy:
         from molt.utils.utils import convert_to_torch_dtype
 
         torch_dtype = convert_to_torch_dtype(self.param_dtype)
-        # Match the FSDP2 baseline: params/forward in the requested dtype and
-        # reduce-scatter in fp32. Do not force module outputs to fp32 here,
-        # because policy/value losses should see the same dtype behavior as
-        # the DeepSpeed and PR #1176 paths.
+        # Params/forward in the requested dtype, reduce-scatter in fp32. Don't force
+        # module outputs to fp32: policy/value losses must see the same dtype
+        # behavior as the DeepSpeed and PR #1176 paths.
         mp_policy = (
             None
             if torch_dtype == torch.float32
@@ -214,20 +203,11 @@ class FsdpStrategy:
                 cast_forward_inputs=True,
             )
         )
-        # Public attribute: `Actor` reads it as `strategy.distributed_config`
-        # and forwards to `NeMoAutoModelForCausalLM.from_pretrained`.
-        #
-        # Activation checkpointing is driven HERE, through FSDP2Config — this is
-        # the switch FSDP2Manager reads (fsdp2.py: self.activation_checkpointing
-        # = config.activation_checkpointing) for dense / EP=1 / HF-fallback
-        # models, where parallelize() applies AC via fsdp2_strategy_parallelize.
-        # The from_pretrained(activation_checkpointing=) kwarg the Actor also
-        # passes is DEAD on that path (it only reaches the EP MoE parallelizer,
-        # built only for ep_size>1); leaving this field at its default False
-        # meant any dense model — and every HF-fallback model — trained with NO
-        # activation checkpointing and OOM'd on long sequences. For ep_size>1
-        # the EP parallelizer takes its own AC from that kwarg, so setting this
-        # field is a no-op there (MoE runs unchanged). Single source of truth:
+        # Public attribute `strategy.distributed_config`, forwarded to from_pretrained.
+        # Activation checkpointing MUST be set here via FSDP2Config for dense / EP=1 /
+        # HF-fallback models: the from_pretrained(activation_checkpointing=) kwarg only
+        # reaches the ep_size>1 MoE parallelizer, so otherwise those models train with
+        # no AC and OOM on long sequences. Source of truth:
         # --actor.gradient_checkpoint (RL) / --model.gradient_checkpoint (SFT).
         _actor_cfg = getattr(self.args, "actor", None)
         _model_cfg = getattr(self.args, "model", None)
@@ -239,35 +219,21 @@ class FsdpStrategy:
             mp_policy=mp_policy,
             offload_policy=CPUOffloadPolicy(pin_memory=False) if self.cpu_offload else None,
             activation_checkpointing=activation_checkpointing,
-            # defer_fsdp_grad_sync=False: every microbatch reduce-scatters and
-            # accumulates its gradient into .grad (sync is always on; see
-            # backward()). The accumulation window is realized by deferring
-            # optimizer_step, not by skipping sync — so grads stay materialized
-            # for clipping and logging.
+            # defer_fsdp_grad_sync=False: every microbatch reduce-scatters into .grad.
+            # The accumulation window comes from deferring optimizer_step, not skipping
+            # sync, so grads stay materialized for clipping and logging.
             defer_fsdp_grad_sync=False,
         )
-        # MoE-specific parallelization config: required by AutoModel when
-        # ep_size > 1 (raises 'NoneType has no to_dict' otherwise).
-        # ignore_router_for_ac=True → selective activation checkpointing that
-        # MUST_SAVEs the router projection so the topk routing decision is NOT
-        # recomputed in backward. Without it, plain AC recomputes the router and
-        # FSDP2's mixed-precision input cast isn't replayed bit-identically, so a
-        # near-tie token re-routes on recompute → per-expert token counts shift
-        # → grouped-GEMM tensor shapes drift ±1 → CheckpointError. Saving the
-        # routing decision freezes those shapes (the Automodel analog of
-        # Megatron's higher-precision/stabilized router).
-        # reshard_after_forward: free the all-gathered params/experts after the
-        # forward and re-gather them in backward — trades one extra backward
-        # all-gather for a lower activation-phase peak. AutoModel's MoE EP path
-        # (moe/parallelizer.py apply_fsdp) defaults this to False (gather-and-hold,
-        # throughput-favoring) for EVERY module incl. experts, UNLIKE its dense
-        # path which reshards all-but-last. NeMo-RL exposes it the same way: an
-        # opt-in `dtensor_cfg.moe_parallelizer.reshard_after_forward` (NotRequired,
-        # falls back to AutoModel's False; models/policy/__init__.py). We mirror
-        # that — default OFF (bit-identical to today), opt in via env for
-        # memory-bound runs (omni3 32K/CP8). MUST smoke-test under deepep+AC before
-        # trusting it: re-gathering experts in backward must not perturb the AC
-        # recompute (CheckpointError) and logprobs_diff must stay 0.
+        # MoE parallelization config, required when ep_size > 1.
+        # ignore_router_for_ac=True → selective AC that saves the router projection so
+        # the topk routing is NOT recomputed in backward; otherwise a near-tie token
+        # re-routes on recompute → per-expert counts shift → grouped-GEMM shapes drift
+        # ±1 → CheckpointError.
+        # reshard_after_forward (MOLT_MOE_RESHARD_AFTER_FWD): free the all-gathered
+        # experts after forward and re-gather in backward — one extra all-gather for a
+        # lower activation peak. Default OFF (bit-identical); opt in for memory-bound
+        # runs (e.g. 32K/CP8). Smoke-test under deepep+AC: the re-gather must not
+        # perturb the AC recompute and logprobs_diff must stay 0.
         _reshard_after_fwd = os.environ.get("MOLT_MOE_RESHARD_AFTER_FWD", "0") == "1"
         self.moe_config = (
             MoEParallelizerConfig(
@@ -279,9 +245,8 @@ class FsdpStrategy:
             else None
         )
 
-        # AutoModel 015b0f621 renamed create_device_mesh -> _create_device_meshes
-        # and bundles the per-dim sizes into ParallelismSizes (dp inferred). Return
-        # is still (device_mesh, moe_mesh). Mirrors MeshContext.build (mesh.py).
+        # _create_device_meshes takes per-dim sizes via ParallelismSizes (dp inferred)
+        # and returns (device_mesh, moe_mesh). Mirrors MeshContext.build (mesh.py).
         self.device_mesh, self.moe_mesh = _create_device_meshes(
             self.distributed_config,
             ParallelismSizes(
@@ -293,17 +258,11 @@ class FsdpStrategy:
             world_size=self.world_size,
         )
 
-        # init_device_mesh's sub-process-groups (the CP all-to-all and the
-        # EP/ep_shard reduce-scatter — the latter spans nodes under PACK) inherit
-        # NCCL's 600s default watchdog, NOT the longer `timeout` we pass to
-        # init_process_group for the world group. On the compile-bound cold first
-        # step a legitimate cross-node collective wait can approach 600s and trip
-        # the watchdog -> SIGABRT (the multi-node DP2 hang, job 4788092). Raise
-        # every mesh sub-group's timeout to the world value so a slow-but-
-        # progressing step waits instead of aborting. The real fix is balancing
-        # the per-microbatch load (balance_experiences sorts by length so DP ranks
-        # reach each cross-node collective together); this is the safety net for a
-        # residual single-outlier trajectory.
+        # init_device_mesh's sub-process-groups (CP all-to-all, EP reduce-scatter)
+        # inherit NCCL's 600s watchdog, not the longer `timeout` we pass for the world
+        # group. On the compile-bound cold first step a cross-node collective can
+        # approach 600s and trip the watchdog → SIGABRT. Raise every sub-group's
+        # timeout to the world value so a slow-but-progressing step waits, not aborts.
         from torch.distributed.distributed_c10d import _set_pg_timeout
 
         _seen_pg = set()
@@ -315,9 +274,8 @@ class FsdpStrategy:
                     _seen_pg.add(id(_pg))
                     _set_pg_timeout(timeout, _pg)
 
-        # AutoModel's FSDP2 mesh exposes flattened "dp" for data loading and
-        # "dp_cp" for FSDP reduce-scatter. Gradient accumulation is based on
-        # DP only; CP ranks share samples and split sequence work.
+        # Mesh exposes flat "dp" for data loading and "dp_cp" for FSDP reduce-scatter.
+        # Grad accumulation is DP-only; CP ranks share samples and split sequence work.
         dp_size = self._get_dp_group_size(include_cp=False)
         self.dp_cp_size = self._get_dp_group_size(include_cp=True)
         if getattr(getattr(self.args, "train", None), "dynamic_batch_enable", False):
@@ -403,17 +361,11 @@ class FsdpStrategy:
         fsdp_modules = [module for module in model.modules() if isinstance(module, FSDPModule)]
         if not fsdp_modules:
             return
-        # Set the sync/reshard flags on EVERY FSDP root, not just the first.
-        # With the DeepEP MoE dispatcher (EP>1) the experts form a SEPARATE FSDP
-        # root from the dense backbone, so setting flags only on fsdp_modules[0]
-        # left the experts root at its default. In the RL path (gradient
-        # accumulation with sync=False on non-last microbatches and no
-        # per-microbatch loss scaling) the experts root then kept syncing every
-        # microbatch out of step with the deferred dense root, leaving the
-        # expert grads effectively unreduced across the window and inflating the
-        # grad-norm by ~grad_acc x. Looping covers both roots; in the SFT path
-        # (sync always True) it is a no-op, which is why SFT validated clean on
-        # the single-root code.
+        # Set the flags on EVERY FSDP root, not just the first: with the DeepEP MoE
+        # dispatcher (EP>1) the experts are a SEPARATE FSDP root from the backbone, so
+        # flagging only fsdp_modules[0] left the experts syncing every microbatch out
+        # of step with the deferred dense root — expert grads went effectively
+        # unreduced across the accumulation window, inflating grad-norm by ~grad_acc×.
         for fsdp_module in fsdp_modules:
             fsdp_module.set_is_last_backward(sync)
             fsdp_module.set_reshard_after_backward(sync)
@@ -432,22 +384,12 @@ class FsdpStrategy:
         if accumulate and self.accumulated_gradient > 1:
             if kwargs.get("scale_loss_by_accumulation", True):
                 loss = loss / self.accumulated_gradient
-        # Context-parallel gradient compensation.
-        # The trainers normalize the loss with the `token-mean` convention
-        # scaled by *dp_size* (global tokens reduced over DP only). That keeps
-        # the *reported* loss correct — it is detached before this point and
-        # logged via all_reduce(mean) over the world — and was the right grad
-        # scaling pre-CP, when FSDP's grad-averaging group equaled dp_size.
-        # With CP, AutoModel shards/reduces parameter grads over `dp_shard_cp`,
-        # so FSDP averages grads over dp_cp = dp_size * cp_size. The CP loss
-        # gather (`cp_dtensor_full_sequence` -> DTensor.full_tensor()) makes
-        # every CP rank compute the *full* sequence loss, and its autograd
-        # *slices* the gradient back to each rank's sequence shard (verified:
-        # full_tensor() backward does not sum across CP). Net effect: without
-        # this factor the gradient is cp_size x too small (effective LR / cp).
-        # Multiply only the backward loss by cp_size so the post-FSDP gradient
-        # matches AutoModel's own `(loss * dp_cp_size).backward()` recipe; the
-        # detached reported loss is untouched. No-op when cp_size == 1.
+        # Context-parallel gradient compensation. FSDP averages param grads over
+        # dp_cp = dp_size * cp_size, but the loss is token-mean-normalized over dp_size
+        # only and every CP rank computes the full-sequence loss (full_tensor() backward
+        # slices, doesn't sum, across CP). So without this the gradient is cp_size× too
+        # small. Scale only the backward loss (reported loss untouched) to match
+        # AutoModel's `(loss * dp_cp_size).backward()`. No-op when cp_size == 1.
         if self.cp_size > 1:
             loss = loss * self.cp_size
         sync_gradients = kwargs.get("sync_gradients", True)
@@ -484,8 +426,7 @@ class FsdpStrategy:
         model = self._unwrap_model(model)
         params = [p for p in model.parameters() if p.grad is not None]
         self._last_grad_norm = 0.0
-        # Clip/scale only when there are grads to act on; the optimizer tail
-        # below runs either way (an empty step is a no-op).
+        # Clip/scale only when there are grads; the optimizer tail runs either way.
         if params:
             self._maybe_debug_grad_stats(model, name)
             max_norm = self._max_norm_by_optimizer.get(id(optimizer), self.max_norm)
@@ -517,9 +458,9 @@ class FsdpStrategy:
         optimizer.zero_grad(set_to_none=True)
 
     def offload_moments_to_cpu(self, optimizer: optim.Optimizer) -> None:
-        """Page the Adam moments back to CPU after a checkpoint resume (DCP restores them
-        onto the model param's GPU device). Called from load_ckpt before the first
-        forward; a no-op unless the optimizer is CPU-offloaded."""
+        """Page the Adam moments back to CPU after a checkpoint resume (DCP restores
+        them onto the model param's GPU device). No-op unless the optimizer is
+        CPU-offloaded."""
         if self._optimizer_offloader is not None:
             self._optimizer_offloader.moments_to_cpu(optimizer)
 
@@ -527,19 +468,12 @@ class FsdpStrategy:
         """Mean-all-reduce gradients of replicated (non-FSDP-wrapped) params over the
         data-parallel(+CP) group.
 
-        FSDP2 only reduces gradients of params inside its wrapped modules. A module
-        added after wrapping (e.g. the critic's scalar value head) is replicated and
-        gets a *local* gradient per rank, so it must be averaged over the same
-        ``dp_cp`` group FSDP uses to match the wrapped params' effective gradient.
-        Call it right before ``optimizer_step`` on the relevant optimizer-step
-        microbatch.
-
-        Invariant: molt builds a *flat* FSDP2 data-parallel mesh (``_create_device_meshes``
-        infers a single ``dp`` shard dim — no ``dp_replicate``/HSDP path), so ``dp_cp``
-        is exactly the ``dp_shard_cp`` group FSDP reduces the wrapped params over, and
-        this mean matches the backbone's effective gradient. If HSDP (``dp_replicate>1``)
-        is ever added, revisit: a fully-replicated head must still reduce over the full
-        ``dp_replicate × dp_shard × cp`` set, which ``dp_cp`` must then continue to span.
+        FSDP2 only reduces grads of params inside its wrapped modules; a module added
+        after wrapping (e.g. the critic's scalar value head) is replicated with a local
+        grad per rank, so it must be averaged over the same ``dp_cp`` group FSDP uses.
+        Call right before ``optimizer_step``. Assumes a flat DP mesh (no HSDP/
+        ``dp_replicate``); if HSDP is added, ``dp_cp`` must still span the full
+        replicate × shard × cp set.
         """
         group = self._get_dp_group(include_cp=True)
         if group is None:
@@ -637,15 +571,10 @@ class FsdpStrategy:
     ) -> dict:
         """Peak memory + training MFU/throughput for one optimization phase.
 
-        MFU is delegated to AutoModel's ``AutoMFU`` over the GLOBAL batch and ALL
-        GPUs (so it is parallelism-invariant); global sequence + token counts reuse
-        ``global_token_count`` (DP-mesh all-reduce), and the mean length feeds
-        AutoMFU's rectangular ``(batch, seq_len)`` formula. ``mfu`` is the caller's
-        ``AutoMFU`` instance (None -> memory only). ``prefix`` namespaces the keys so
-        colocated models (actor vs critic) report under distinct names instead of
-        overwriting each other on the last-wins status merge — and, since they are
-        separate processes sharing the GPU, their peak-memory numbers ADD up to the
-        true device pressure.
+        MFU is delegated to AutoModel's ``AutoMFU`` over the GLOBAL batch and ALL GPUs
+        (parallelism-invariant); ``mfu`` is the caller's ``AutoMFU`` (None -> memory
+        only). ``prefix`` namespaces keys so colocated actor/critic report separately
+        instead of overwriting on the last-wins status merge.
         """
         metrics = {}
         if torch.cuda.is_available():
@@ -655,8 +584,7 @@ class FsdpStrategy:
         if mfu is None or seconds <= 0.0:
             return metrics
 
-        # True step time is the slowest rank's; reduce to max so MFU is the same
-        # aggregate number on every rank (the per-worker status merge is last-wins).
+        # Step time = slowest rank's; reduce to max so MFU is identical on every rank.
         seconds = self.all_reduce(seconds, op="max")
         global_tokens = float(self.global_token_count(torch.tensor(local_token_sum)))
         global_seqs = float(self.global_token_count(torch.tensor(local_seq_count)))
@@ -740,9 +668,8 @@ class FsdpStrategy:
         return model
 
     # ---------------------------------------------------------------- I/O
-    # All on-disk checkpoint I/O lives in CheckpointManager (self.checkpoint);
-    # these thin wrappers preserve the historical strategy.save_*/load_* surface
-    # that trainers and CLIs already call.
+    # On-disk checkpoint I/O lives in CheckpointManager; these thin wrappers preserve
+    # the strategy.save_*/load_* surface trainers and CLIs call.
 
     def save_model(self, model: nn.Module, tokenizer, output_dir: str, **kwargs) -> None:
         self.checkpoint.save_model(model, tokenizer, output_dir, **kwargs)

@@ -2,11 +2,11 @@
 # Single-node quick-start: Qwen3.6-35B-A3B (Qwen3.5-MoE) VLM RL on geo3k.
 #
 # 8 GPUs on one machine, split 4 actor + 4 vLLM rollout. No slurm. Same recipe
-# as slurm/rl_qwen3_6.sh — only the topology differs (1 node here, 2+ there).
+# as slurm/rl_qwen3_6_35b.sh — only the topology differs (1 node here, 2+ there).
 # Multi-turn rollout uses the `<tool_call>` geo3k math grader (with a boxed
 # fallback that gives partial credit for raw `\boxed{}` answers).
 #
-#   MODEL_PATH=/path/to/Qwen3.6-35B-A3B bash examples/scripts/quick_start/rl_qwen3_6.sh
+#   MODEL_PATH=/path/to/Qwen3.6-35B-A3B bash examples/scripts/quick_start/rl_qwen3_6_35b.sh
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${MOLT_PATH:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a Qwen3.6-35B-A3B checkpoint.}"
 
-# geo3k VLM multi-turn — same default as slurm/rl_qwen3_6.sh. Auto-prep if missing.
+# geo3k VLM multi-turn — same default as slurm/rl_qwen3_6_35b.sh. Auto-prep if missing.
 DATA_DIR="$REPO_ROOT/.tmp/geo3k"
 if [ ! -d "$DATA_DIR/train" ]; then
   echo "[quickstart] preparing geo3k VLM (VeraIsHere/geo3k_imgurl_processed) — one-time"
@@ -48,7 +48,7 @@ trap '[ "$STARTED_RAY" = "1" ] && ray stop --force >/dev/null 2>&1 || true' EXIT
 
 cd "$REPO_ROOT"
 # Smoke-friendly config: smaller batch + 16K ctx so it fits on a single node.
-# Bump for stability runs on multi-node (slurm/rl_qwen3_6.sh).
+# Bump for stability runs on multi-node (slurm/rl_qwen3_6_35b.sh).
 python3 -u -m molt.cli.train_rl_ray \
   --actor.model_name_or_path "$MODEL_PATH" \
   --data.prompt_dataset "$PROMPT_DATASET" \

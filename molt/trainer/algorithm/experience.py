@@ -24,13 +24,10 @@ def to(tensor: Union[torch.Tensor, list[torch.Tensor]], device):
 
 
 def get_model_parallel_size(args) -> int:
-    """Members of one DP group — i.e. ranks that see the same data shard.
+    """Members of one DP group — the ranks that share a data shard, i.e. ``cp * tp``.
 
-    AutoModel uses two orthogonal meshes: an FSDP mesh
-    `(dp_replicate, dp_shard, cp, tp)` and a MoE mesh `(ep_shard, ep)`. EP
-    ranks shard experts but each EP rank still belongs to its own DP shard,
-    so EP does NOT multiply into the divisor that splits a batch across DP
-    groups. Only `cp * tp` ranks within one DP group share a data shard.
+    EP shards experts on a separate MoE mesh but each EP rank still owns its full data
+    shard, so EP must NOT enter the divisor that splits a batch across DP groups.
     """
     fsdp = args.fsdp
     return int(fsdp.cp_size) * int(fsdp.tp_size)
@@ -61,11 +58,10 @@ class Experience:
     action_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) log pi_theta(a|s)
     base_action_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) log pi_ref(a|s)
     rollout_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) log pi_old(a|s)
-    # R3 rollout routing replay: the rollout router's top-k expert ids per token,
-    # one row per MoE layer. Stored seq-LAST as (B, num_moe_layers, topk, T) so it
-    # rides the same right-pad/concat/stack machinery as the (B, T) step tensors
-    # (zero_pad_sequences pads the last dim). The actor forward permutes it back to
-    # token-major and replays it (see Actor.forward / RouterReplay). None when R3 off.
+    # R3 rollout routing replay: the rollout router's top-k expert ids per token, one row
+    # per MoE layer. Stored seq-LAST as (B, num_moe_layers, topk, T) so it rides the same
+    # right-pad/concat/stack machinery as the (B, T) step tensors; the actor forward
+    # permutes it back to token-major and replays it. None when R3 off.
     routed_experts: torch.Tensor = tensor_field("step", default=None)
 
     # Policy-gradient targets
@@ -92,11 +88,10 @@ class Experience:
     images: list = field(default_factory=list)  # per-sample image paths/URLs for VLM (None entries for text-only)
     mm_train_inputs: list = field(default_factory=list)  # per-sample processor outputs (pixel_values dicts) for VLM
     info: dict = field(default_factory=dict)  # per-sample metrics for logging
-    # GRPO grouping identity. `group_ids` (= prompt id) is shared by all N
-    # rollouts of one prompt — the trainer averages their rewards to form the
-    # baseline. `rollout_ids` is unique per trajectory; multi-turn agents emit
-    # several step-samples sharing one rollout_id so the trainer can dedup to
-    # one reward per rollout before grouping by group_id.
+    # GRPO grouping identity. `group_ids` (= prompt id) is shared by all N rollouts of one
+    # prompt — the trainer averages their rewards to form the baseline. `rollout_ids` is
+    # unique per trajectory; multi-turn agents emit several step-samples sharing one
+    # rollout_id so the trainer dedups to one reward per rollout before grouping by group_id.
     group_ids: list[str] = field(default_factory=list)
     rollout_ids: list[str] = field(default_factory=list)
 
@@ -278,13 +273,9 @@ def remove_padding_in_sequences(items: List[Experience]) -> List[Experience]:
 def balance_experiences(experiences, args):
     """Balance samples across DP ranks by total sequence length, equal-count.
 
-    Every DP rank must receive the SAME number of samples. ``setup_dynamic_batch``
-    derives ``num_steps = len(items) // local_train_batch_size`` locally and then
-    runs a world ``all_reduce(max)`` on the per-step ``num_microbatches`` tensor;
-    the training loop also issues a per-microbatch ``global_token_count``
-    all_reduce. Unequal per-rank counts yield different ``num_steps`` → mismatched
-    collective shapes → NCCL hang. We therefore use equal-size length balancing
-    (the ``balance_batch`` contract) and drop the trailing remainder so the
+    Every DP rank must receive the SAME number of samples: unequal counts yield different
+    ``num_steps`` per rank → mismatched collective shapes at the world all_reduces → NCCL
+    hang. So we use equal-size length balancing and drop the trailing remainder so the
     global sample count divides evenly across ranks.
     """
     items_all = []
@@ -318,18 +309,12 @@ def balance_experiences(experiences, args):
     # equal_size=True keeps each rank's sample count identical while still
     # minimizing the per-rank total-token spread (Karmarkar–Karp).
     partitions = get_seqlen_balanced_partitions(lengths, effective_num, equal_size=True)
-    # Align the per-microbatch token load across DP ranks. The k-th microbatch of
-    # every rank runs in lockstep at a CROSS-NODE collective: the expert-grad
-    # reduce-scatter shards over ep_shard, which spans nodes (PACK keeps ep/cp
-    # intra-node but ep_shard pairs rank i with i+ep_size), and FSDP reduce-scatters
-    # per microbatch. If rank A's k-th microbatch is a 32K trajectory while rank B's
-    # is 1K, B finishes and waits on A at that reduce-scatter; with the variable
-    # trajectory lengths of multi-turn RL the gap can exceed the 600s NCCL watchdog
-    # -> SIGABRT (the multi-node DP2 deadlock, job 4788092; DP1 and uniform-length
-    # SFT are immune). KK balances each rank's TOTAL tokens and count but leaves the
-    # within-rank order arbitrary (by index), so the pairing was random. Sorting
-    # every rank's items by length (descending) makes the k-th microbatch similarly
-    # sized on each rank, so they reach the shared reduce-scatter together. The
-    # dataloader preserves this order (no shuffle when model-parallel size > 1).
+    # Sort each rank's items by length (descending) so the k-th microbatch is similarly
+    # sized on every rank. The k-th microbatch runs in lockstep at cross-node
+    # reduce-scatters (expert-grad over ep_shard, plus per-microbatch FSDP), so a size
+    # mismatch makes short ranks wait on a straggler long enough to trip the 600s NCCL
+    # watchdog → SIGABRT. KK balances each rank's total tokens/count but not within-rank
+    # order, so pairing was random. The dataloader preserves this order (no shuffle when
+    # model-parallel size > 1).
     partitions = [sorted(partition, key=lambda idx: lengths[idx], reverse=True) for partition in partitions]
     return [make_experience_batch([items_all[idx] for idx in partition]) for partition in partitions]

@@ -76,6 +76,7 @@ def train(args):
             async_scheduling=args.vllm.async_scheduling,
             decode_context_parallel_size=args.vllm.decode_context_parallel_size,
             dtype=args.vllm.dtype,
+            block_size=args.vllm.block_size,
             mtp_num_speculative_tokens=args.vllm.mtp_num_speculative_tokens,
             enable_return_routed_experts=args.train.routing_replay,
         )
@@ -484,6 +485,13 @@ if __name__ == "__main__":
         default=None,
         help="Optional vLLM attention backend (FLASH_ATTN/FLASHINFER/TRITON_ATTN/FLEX_ATTENTION). "
         "Pass TRITON_ATTN to bypass AOT-compiled FA2/FlashInfer kernels on older drivers.",
+    )
+    parser.add_argument(
+        "--vllm.block_size",
+        type=int,
+        default=None,
+        help="vLLM KV cache block size (tokens). MiniMax-M3 MSA sparse attention requires 128; "
+        "vLLM's default (16) raises 'No common block size' across M3's dense+sparse layers.",
     )
     parser.add_argument(
         "--vllm.mamba_ssm_cache_dtype",

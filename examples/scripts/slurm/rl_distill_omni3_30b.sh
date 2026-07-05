@@ -155,6 +155,11 @@ VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.95}"
 VLLM_MM_ENCODER_ATTN_BACKEND="${VLLM_MM_ENCODER_ATTN_BACKEND:-TORCH_SDPA}"
 VLLM_GDN_PREFILL_BACKEND="${VLLM_GDN_PREFILL_BACKEND:-triton}"
 VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-TRITON_ATTN}"
+# omni3 is a hybrid Mamba2 model: force vLLM's SSM state cache to fp32 to match
+# the fp32 training recompute. The vLLM fp16 default rounds over the rollout scan
+# and drifts rollout log-probs from training — fatal here, since the rollout-vs-
+# teacher per-token KL IS the distillation signal, not just a diagnostic.
+VLLM_MAMBA_SSM_CACHE_DTYPE="${VLLM_MAMBA_SSM_CACHE_DTYPE:-float32}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-mp}"
 VLLM_ENABLE_EXPERT_PARALLEL="${VLLM_ENABLE_EXPERT_PARALLEL:-1}"
@@ -312,6 +317,7 @@ RL_ARGS=(
   --vllm.mm_encoder_attn_backend "$VLLM_MM_ENCODER_ATTN_BACKEND"
   --vllm.gdn_prefill_backend "$VLLM_GDN_PREFILL_BACKEND"
   --vllm.attention_backend "$VLLM_ATTENTION_BACKEND"
+  --vllm.mamba_ssm_cache_dtype "$VLLM_MAMBA_SSM_CACHE_DTYPE"
   --vllm.distributed_executor_backend "$VLLM_DISTRIBUTED_EXECUTOR_BACKEND"
   --fsdp.param_dtype bf16
   --fsdp.attn_implementation "$FSDP_ATTN_IMPLEMENTATION"

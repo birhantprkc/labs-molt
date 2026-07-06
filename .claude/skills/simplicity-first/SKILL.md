@@ -29,12 +29,19 @@ ships.
    otherwise inline it. Never wrap trivial code. Never change a function
    signature or return shape to thread data that only one caller needs.
 
+5. **Simplicity is not deletion of capability.** Features, performance knobs,
+   and observability are intentional — do not remove them in the name of
+   simplicity. Knobs default ON stay ON. Simplify the implementation, keep
+   the behavior surface.
+
 ## Checklist before finishing any change
 
 - Would a human reading this cold understand it in one pass? That is the gate.
 - Could this diff be half the size? If unsure, make it smaller.
 - Any new class or file? Justify each with 3+ call sites, or delete it.
 - Any signature / return-shape change? Verify every caller genuinely needs it.
-- Comments: concise "why" only, 2-4 lines max, release quality.
+- Comments: concise "why" only, 2-4 lines max, written for an external reader —
+  no job ids, commit hashes, single-run metrics, or internal paths; keep
+  upstream issue/PR links.
 - One problem = one minimal diff. Do not batch unrelated "improvements".
 - A "bug" that cannot trigger under the real recipes is not worth fixing.

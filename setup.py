@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import sys
 import platform
@@ -59,7 +62,8 @@ class bdist_wheel(_bdist_wheel):
 
 # Setup configuration
 setup(
-    author="Molt contributors",
+    author="NVIDIA CORPORATION & AFFILIATES",
+    license="Apache-2.0",
     name=_fetch_package_name(),
     version=_fetch_version(),
     packages=find_packages(

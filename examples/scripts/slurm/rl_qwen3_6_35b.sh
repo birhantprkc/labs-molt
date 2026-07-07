@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 #SBATCH --account=your_slurm_account
 #SBATCH --partition=interactive
@@ -196,6 +198,12 @@ VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-mp}"
 VLLM_ENABLE_EXPERT_PARALLEL="${VLLM_ENABLE_EXPERT_PARALLEL:-1}"
+# Rollout-only speedups: MTP speculative decoding (0=off; the draft is auto-detected
+# from the checkpoint's MTP head — qwen3.6 ships one, so 1 is the safe depth) and the
+# vLLM prefix KV cache (multi-turn rollouts re-prefill the growing history each turn;
+# the trainer resets the cache after every weight broadcast).
+MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-0}"
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-0}"
 # AutoModel actor side: 1 dedicated node, TP+EP+CP for MoE actors.
 ACTOR_NODES="${ACTOR_NODES:-1}"
 ACTOR_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE:-8}"
@@ -370,6 +378,8 @@ RL_ARGS=(
   --vllm.gdn_prefill_backend "$VLLM_GDN_PREFILL_BACKEND"
   --vllm.mamba_ssm_cache_dtype "$VLLM_MAMBA_SSM_CACHE_DTYPE"
   --vllm.distributed_executor_backend "$VLLM_DISTRIBUTED_EXECUTOR_BACKEND"
+  --vllm.mtp_num_speculative_tokens "$MTP_NUM_SPECULATIVE_TOKENS"
+  $([ "$ENABLE_PREFIX_CACHING" != 0 ] && echo --vllm.enable_prefix_caching || true)
   --fsdp.param_dtype bf16
   --fsdp.attn_implementation "$FSDP_ATTN_IMPLEMENTATION"
   --fsdp.tp_size "$TP_SIZE"

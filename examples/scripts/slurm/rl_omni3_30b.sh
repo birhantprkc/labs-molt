@@ -442,6 +442,11 @@ if [ "$FORCE_ON_POLICY" = "1" ]; then
   RL_ARGS+=(--train.force_on_policy)
 fi
 
+# Warm-resume the async rollout buffer across segment restarts (opt-in; off by default).
+if [ "${WARM_RESUME_ROLLOUTS:-0}" = "1" ]; then
+  RL_ARGS+=(--ckpt.warm_resume_rollouts)
+fi
+
 if [ "$VLLM_ENFORCE_EAGER" = "1" ]; then
   RL_ARGS+=(--vllm.enforce_eager)
 fi

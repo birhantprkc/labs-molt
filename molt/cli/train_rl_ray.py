@@ -247,6 +247,14 @@ if __name__ == "__main__":
         help="Eval metric key for best checkpoint saving (e.g., eval_default_pass1). "
         "Empty string auto-detects first pass1 metric. Set to 'none' to disable best checkpoint saving.",
     )
+    parser.add_argument(
+        "--ckpt.warm_resume_rollouts",
+        action="store_true",
+        help="Persist the completed-but-unshipped rollout groups beside the checkpoint so a "
+        "resumed async run trains them immediately instead of idling ~one generation while the "
+        "pipeline refills (NeMo-RL replay_buffer analogue). Opt-in/experimental; best-effort — a "
+        "failed save or missing file falls back to the stateless resume.",
+    )
     # wandb + TensorBoard + logging cadence.
     add_logger_args(parser, default_wandb_project="molt_train_rl", run_name_prefix="rl")
 

@@ -89,16 +89,41 @@ class SamplesGenerator:
         self.prompts_dataloader = prompts_dataloader
         self.eval_dataloader = eval_dataloader
 
-    # The generator is stateless across checkpoints. Persisting the in-flight prompt
-    # payloads here previously bloated the checkpoint ~1000x (22-78 MB vs ~7 KB) and
-    # crashed the driver on resume. The StatefulDataLoader cursor already points past
-    # the in-flight prefetch, so on resume those few prompts are skipped rather than
-    # redispatched — a bounded loss that is negligible for multi-epoch RL.
+    # Warm-resume (opt-in via --ckpt.warm_resume_rollouts; NeMo-RL replay_buffer.pt analogue):
+    # persist the completed-but-unshipped rollout groups so a resumed run trains them immediately
+    # instead of idling ~one generation while the async pipeline refills. Only complete, filtered
+    # groups are in _finished_samples; the train-computed fields (advantages/action_log_probs/…)
+    # are still None here, so we persist near-minimal — the rollout tensors we need
+    # (tokens + rollout_log_probs + R3 routed_experts + mm inputs) plus cheap None placeholders.
+    # Written to a SIDECAR FILE (not the state_dict itself): routing the multi-GB batch through
+    # the Ray queue/driver bloated the checkpoint ~1000x and crashed the driver. Best-effort at
+    # both ends — a failed save or missing/unreadable file falls back to the stateless resume.
+    _BUFFER = "rollout_buffer.pt"
+
+    def _buffer_path(self) -> str:
+        return os.path.join(os.path.dirname(self.args.ckpt.path.rstrip("/")), self._BUFFER)
+
     def state_dict(self) -> Dict:
-        return {}
+        finished = getattr(self, "_finished_samples", None)
+        if not getattr(self.args.ckpt, "warm_resume_rollouts", False) or not finished:
+            return {}
+        try:
+            path = self._buffer_path()
+            torch.save(list(finished), path)
+            return {"buffer_file": path}
+        except Exception as e:  # never let checkpoint bookkeeping break the run
+            logger.warning(f"warm-resume: save skipped ({e})")
+            return {}
 
     def load_state_dict(self, state_dict: Optional[Dict]) -> None:
-        return
+        path = (state_dict or {}).get("buffer_file")
+        if not path or not os.path.exists(path):
+            return  # optional: no buffer / failed save -> stateless resume
+        try:
+            self._resumed_samples = torch.load(path, map_location="cpu", weights_only=False)
+            logger.info(f"warm-resume: restored {len(self._resumed_samples)} rollout groups")
+        except Exception as e:
+            logger.warning(f"warm-resume: load skipped ({e})")
 
     @torch.no_grad()
     def generate_eval_samples(self, **generate_kwargs) -> List[Experience]:
@@ -142,7 +167,10 @@ class SamplesGenerator:
         """
         if getattr(self, "_dataloader_iter", None) is None:
             self._dataloader_iter = iter(self.prompts_dataloader)
-            self._finished_samples: List[Experience] = []
+            # Seed from a warm-resume buffer if load_state_dict restored one, so the first
+            # post-resume batch ships without waiting for a full fresh generation. Consumed once.
+            self._finished_samples: List[Experience] = list(getattr(self, "_resumed_samples", None) or [])
+            self._resumed_samples = None
             self._inflight_rollouts: List = []
 
         groups_per_batch = self.args.rollout.batch_size

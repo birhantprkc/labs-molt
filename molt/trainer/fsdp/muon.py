@@ -73,7 +73,11 @@ def build_automodel_muon_optimizer(
     lm_head) uses ``--<role>.adam.*`` -- the two weight decays are independent,
     matching the CLI help.
     """
-    from nemo_automodel.components.optim import utils as automodel_optim
+    # AutoModel renamed optim/utils.py -> optim/dion.py; support both pins.
+    try:
+        from nemo_automodel.components.optim import dion as automodel_optim
+    except ImportError:
+        from nemo_automodel.components.optim import utils as automodel_optim
 
     target = getattr(automodel_optim, "Muon", None)
     if target is None:

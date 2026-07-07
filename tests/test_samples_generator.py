@@ -81,6 +81,7 @@ def test_generate_samples_returns_batch_as_rollouts_finish_and_keeps_pool_satura
     generator.args = SimpleNamespace(
         rollout=SimpleNamespace(batch_size=3, n_samples_per_prompt=1, vllm_generate_batch_size=5),
         algo=SimpleNamespace(dynamic_filtering_enable=False),
+        ckpt=SimpleNamespace(warm_resume_rollouts=False),
     )
     generator.prompts_dataloader = _prompt_loader(10)
     _wire_fake_vllm(generator, monkeypatch, _sample)
@@ -104,6 +105,7 @@ def test_generate_samples_emits_short_batch_when_dataloader_exhausted(monkeypatc
     generator.args = SimpleNamespace(
         rollout=SimpleNamespace(batch_size=4, n_samples_per_prompt=1, vllm_generate_batch_size=5),
         algo=SimpleNamespace(dynamic_filtering_enable=False),
+        ckpt=SimpleNamespace(warm_resume_rollouts=False),
     )
     generator.prompts_dataloader = _prompt_loader(2)
     _wire_fake_vllm(generator, monkeypatch, _sample)
@@ -121,6 +123,7 @@ def test_generate_samples_pool_persists_across_calls(monkeypatch):
     generator.args = SimpleNamespace(
         rollout=SimpleNamespace(batch_size=3, n_samples_per_prompt=1, vllm_generate_batch_size=5),
         algo=SimpleNamespace(dynamic_filtering_enable=False),
+        ckpt=SimpleNamespace(warm_resume_rollouts=False),
     )
     generator.prompts_dataloader = _prompt_loader(10)
     _wire_fake_vllm(generator, monkeypatch, _sample)
@@ -150,6 +153,7 @@ def test_generator_keeps_no_checkpoint_state_and_resumes_from_dataloader(monkeyp
     generator.args = SimpleNamespace(
         rollout=SimpleNamespace(batch_size=3, n_samples_per_prompt=1, vllm_generate_batch_size=5),
         algo=SimpleNamespace(dynamic_filtering_enable=False),
+        ckpt=SimpleNamespace(warm_resume_rollouts=False),
     )
     generator.prompts_dataloader = _prompt_loader(10)
     _wire_fake_vllm(generator, monkeypatch, _sample)
@@ -163,7 +167,7 @@ def test_generator_keeps_no_checkpoint_state_and_resumes_from_dataloader(monkeyp
     restored.args = generator.args
     # The StatefulDataLoader cursor in the checkpoint already points past the
     # prefetched prompts (p0-p6 were read), so resume starts at p7.
-    restored.prompts_dataloader = [(i, [f"p{i}"], [f"l{i}"], [None]) for i in range(7, 10)]
+    restored.prompts_dataloader = [(i, [f"p{i}"], [f"l{i}"], [None], [None]) for i in range(7, 10)]
     _wire_fake_vllm(restored, monkeypatch, _sample)
     restored.load_state_dict(None)  # tolerate a missing payload
     restored.load_state_dict({})  # and an empty one

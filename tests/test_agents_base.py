@@ -25,7 +25,7 @@ class _Engine:
     def __init__(self):
         self.seen_sampling_params = []
 
-    async def generate(self, prompt_token_ids, sampling_params, multi_modal_data=None):
+    async def generate(self, prompt_token_ids, sampling_params, multi_modal_data=None, session_id=None):
         self.seen_sampling_params.append(sampling_params)
         # generate() returns (RequestOutput, off_policy_len); off_policy_len=0 = no
         # mid-generation weight broadcast (on-policy), the partial_rollout-off case.

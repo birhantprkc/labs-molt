@@ -521,6 +521,13 @@ class SamplesGenerator:
         is_clipped = total_length >= truncate_length
 
         info = {"response_clip_ratio": torch.tensor([is_clipped])}
+        if response.mm_train_inputs is not None and (media_ids := self._media_token_ids()):
+            # Embedded image tokens that actually enter training. An image silently dropped
+            # or rendered at reduced resolution shrinks this count while reward/vllm_kl stay
+            # plausible — the one visible trace of an image-blind rollout.
+            info["image_tokens"] = torch.tensor(
+                [sum(1 for t in trajectory_tokens[:truncate_length] if t in media_ids)]
+            )
         if reward_val is not None:
             info["reward"] = torch.tensor([reward_val])
         if score_val is not None:

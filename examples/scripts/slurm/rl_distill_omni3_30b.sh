@@ -176,7 +176,9 @@ VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-TRITON_ATTN}"
 # and drifts rollout log-probs from training — fatal here, since the rollout-vs-
 # teacher per-token KL IS the distillation signal, not just a diagnostic.
 VLLM_MAMBA_SSM_CACHE_DTYPE="${VLLM_MAMBA_SSM_CACHE_DTYPE:-float32}"
-VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
+# Eager stays ON for GDN-hybrid engines: CUDA-graph capture fails at engine init on
+# this vLLM build (worker death -> shm cancelled). Dense-attention models can run 0.
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-mp}"
 VLLM_ENABLE_EXPERT_PARALLEL="${VLLM_ENABLE_EXPERT_PARALLEL:-1}"
 # AutoModel actor side: 2 nodes (DP2), EP+CP for MoE actors (teacher colocated here).

@@ -207,7 +207,9 @@ VLLM_MAMBA_SSM_CACHE_DTYPE="${VLLM_MAMBA_SSM_CACHE_DTYPE:-float32}"
 # Pin TRITON_ATTN on older drivers whose AOT-compiled FA2 PTX fails
 # (cudaErrorUnsupportedPtxVersion), or FLASH_ATTN to force FA.
 VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}"
-VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
+# Eager stays ON for GDN-hybrid engines: CUDA-graph capture fails at engine init on
+# this vLLM build (worker death -> shm cancelled). Dense-attention models can run 0.
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-mp}"
 VLLM_ENABLE_EXPERT_PARALLEL="${VLLM_ENABLE_EXPERT_PARALLEL:-1}"
 # Rollout-only speedups — both OFF by default. Isolation-tested on qwen3.6:

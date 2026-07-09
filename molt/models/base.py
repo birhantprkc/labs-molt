@@ -714,9 +714,17 @@ class BaseModel(nn.Module):
                     sequences = cp_batch["input_ids"]
                 cp_forward = True
 
+        # MOLT_FORWARD_AUTOCAST=0 drops the fp32-master autocast wrapper: FSDP2's
+        # MixedPrecisionPolicy already casts every managed param to bf16 for the
+        # forward, and torch.autocast additionally forces bf16 inputs into ops that
+        # deliberately compute in fp32 — notably the MoE gate (gate_precision
+        # float32), whose bf16-degraded scores flip top-k routing vs the engine's
+        # fp32 router and inflate vllm_kl on routing-sensitive MoE checkpoints.
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=self._forward_autocast_dtype)
-            if self._forward_autocast_dtype is not None and sequences.is_cuda
+            if self._forward_autocast_dtype is not None
+            and sequences.is_cuda
+            and os.environ.get("MOLT_FORWARD_AUTOCAST", "1") != "0"
             else nullcontext()
         )
 

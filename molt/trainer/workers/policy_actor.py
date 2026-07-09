@@ -386,6 +386,27 @@ class PolicyTrainer:
             # both log-probs computed under the rollout's expert selection.
             old_action_log_probs = action_log_probs.detach()
 
+        # Debug observability: MOLT_DUMP_ROLLOUT_LOGPROBS=<path> dumps per-position
+        # token_id / rollout(vLLM) logprob / actor recomputed logprob for the first
+        # sequence of the first microbatch (rank 0, once) — the token-level evidence
+        # needed to diagnose rollout-vs-actor logprob misalignment (e.g. a one-token
+        # shift shows up as actor_logp[i] ~ vllm_logp[i+1]).
+        dump_path = os.environ.get("MOLT_DUMP_ROLLOUT_LOGPROBS")
+        if dump_path and rollout_log_probs is not None and not getattr(self, "_rollout_logprob_dumped", False):
+            self._rollout_logprob_dumped = True
+            if torch.distributed.get_rank() == 0:
+                with open(dump_path, "w") as f:
+                    f.write("pos\ttoken_id\tvllm_logp\tactor_logp\tmask\n")
+                    rows = zip(
+                        sequences[0, 1:].tolist(),
+                        rollout_log_probs[0].float().tolist(),
+                        action_log_probs[0].detach().float().tolist(),
+                        action_mask[0].long().tolist(),
+                    )
+                    for j, (t, v, a, m) in enumerate(rows):
+                        f.write(f"{j}\t{t}\t{v:.6f}\t{a:.6f}\t{m}\n")
+                logger.info(f"MOLT_DUMP_ROLLOUT_LOGPROBS: wrote token-level logprob dump to {dump_path}")
+
         # Stage 3: compute policy loss and metric-only policy diagnostics.
         # reported_actor_loss is a plain per-token mean for logging, decoupled
         # from the global token-mean used for the gradient (actor_loss).

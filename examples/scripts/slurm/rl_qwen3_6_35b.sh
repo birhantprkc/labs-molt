@@ -61,10 +61,11 @@ export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-64}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 export ASYNC_QUEUE_SIZE="${ASYNC_QUEUE_SIZE:-1}"
-# vLLM defaults to 0.95 but only uses ~16GB of 80GB H100. Lowering its
-# reservation gives training process more headroom. Throughput tradeoff
-# (smaller KV cache) is acceptable for a 35B-A3B model on 16K context.
-export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.95}"
+# 0.85, not vLLM's 0.95 default: with the unlimited per-turn token budget this
+# recipe ships, 0.95 leaves the engine no headroom for the weight-refit
+# broadcast and long-context spikes — the failure surfaces as a CUBLAS error
+# at broadcast (an OOM in disguise) and a dead engine behind endless 502s.
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 
 # te — the native MoE attention backend for qwen3_5_moe; enables the te-native CP
 # path and works at any cp (including cp=1). Override to sdpa to fall back.
@@ -192,7 +193,7 @@ MAX_IMAGES_PER_PROMPT="${MAX_IMAGES_PER_PROMPT:-1}"
 # vLLM rollout side: dedicated full node, TP+EP hybrid for MoE.
 VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-1}"
 VLLM_TP_SIZE="${VLLM_TP_SIZE:-8}"
-VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.95}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 VLLM_MM_ENCODER_ATTN_BACKEND="${VLLM_MM_ENCODER_ATTN_BACKEND:-TORCH_SDPA}"
 VLLM_GDN_PREFILL_BACKEND="${VLLM_GDN_PREFILL_BACKEND:-triton}"
 # Qwen3.x GDN is a recurrent linear-attention state, the same class as omni3's
@@ -212,15 +213,17 @@ VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-mp}"
 VLLM_ENABLE_EXPERT_PARALLEL="${VLLM_ENABLE_EXPERT_PARALLEL:-1}"
-# Rollout-only speedups — both OFF by default. Isolation-tested on qwen3.6:
-#  * ENABLE_PREFIX_CACHING=1 is logprob-clean alone AND with routing replay, and slashes
-#    multi-turn re-prefill (sibling rollouts share the prompt prefix within a step).
-#  * MTP (draft auto-detected from the checkpoint's MTP head; ~5x faster generation) is
-#    clean ONLY standalone — it corrupts rollout logprobs with ROUTING_REPLAY (capture
-#    misaligns) and with prefix caching (KV rollback vs cached blocks). The trainer
-#    hard-refuses both combinations.
+# Rollout-only speedups, isolation-tested on qwen3.6:
+#  * ENABLE_PREFIX_CACHING=1 (default ON) is logprob-clean alone AND with routing
+#    replay, and slashes multi-turn re-prefill (sibling rollouts share the prompt
+#    prefix within a step).
+#  * MTP (draft auto-detected from the checkpoint's MTP head; ~5x faster generation)
+#    is clean ONLY standalone — it corrupts rollout logprobs with ROUTING_REPLAY
+#    (capture misaligns) and with prefix caching (KV rollback vs cached blocks).
+#    The trainer hard-refuses both combinations, so enabling MTP requires
+#    ENABLE_PREFIX_CACHING=0.
 MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-0}"
-ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-0}"
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 # AutoModel actor side: 1 dedicated node, TP+EP+CP for MoE actors.
 ACTOR_NODES="${ACTOR_NODES:-1}"
 ACTOR_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE:-8}"

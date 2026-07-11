@@ -100,11 +100,13 @@ export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
 # Actor/ref: 8 dedicated training nodes (64 GPUs).
 export ACTOR_NODES="${ACTOR_NODES:-8}"
 # vLLM rollout on the other 4 nodes (32 GPUs). 397B bf16 (~807GB) does NOT fit 1
-# node (807/8=101GB/GPU); default = 2 engines × TP16 (EP16), each spanning 2 nodes
-# (807/16=50GB/GPU), ray executor for cross-node TP. qwen3_5_moe has no MSA block
-# constraint, so standard TP16 works. kv_heads=2 < 16 → vLLM replicates KV (fine).
+# node (807/8=101GB/GPU). MoE-standard layout: 2 engines at TP=16 with expert
+# parallelism (enable_expert_parallel makes EP = TP = 16), each spanning 2 nodes, so
+# the experts shard EP16 (~50 GB/GPU). This is the verified config. (PP is available
+# via VLLM_PP_SIZE for dense models / comm-bound cases; PP for RL rollout is unproven.)
 export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-2}"
 export VLLM_TP_SIZE="${VLLM_TP_SIZE:-16}"
+export VLLM_PP_SIZE="${VLLM_PP_SIZE:-1}"
 export VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-ray}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
 
@@ -203,6 +205,7 @@ MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 # Pure async + partial rollout: queue depth >= 2 so train overlaps next rollout.
 ASYNC_QUEUE_SIZE="${ASYNC_QUEUE_SIZE:-1}"
 MAX_IMAGES_PER_PROMPT="${MAX_IMAGES_PER_PROMPT:-1}"
+VLLM_PP_SIZE="${VLLM_PP_SIZE:-1}"
 # vLLM rollout side: dedicated full node, TP+EP hybrid for MoE.
 VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-1}"
 VLLM_TP_SIZE="${VLLM_TP_SIZE:-8}"
@@ -390,6 +393,7 @@ RL_ARGS=(
   --ref.num_gpus_per_node "$ACTOR_GPUS_PER_NODE"
   --vllm.num_engines "$VLLM_NUM_ENGINES"
   --vllm.tensor_parallel_size "$VLLM_TP_SIZE"
+  --vllm.pipeline_parallel_size "$VLLM_PP_SIZE"
   --vllm.sync_backend nccl
   --vllm.gpu_memory_utilization "$VLLM_GPU_MEMORY_UTILIZATION"
   --vllm.mm_encoder_attn_backend "$VLLM_MM_ENCODER_ATTN_BACKEND"

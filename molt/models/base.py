@@ -73,7 +73,9 @@ def _has_hf_flash_attn_2() -> bool:
 
 
 _HF_ATTN_IMPLEMENTATIONS = {"eager", "sdpa", "flash_attention_2", "flash_attention_3", "te"}
-_CUSTOM_ATTN_IMPLEMENTATIONS = {"te", "sdpa", "flex"}
+# "tilelang" drives AutoModel's DSA (DeepSeek-style sparse attention) TileLang
+# kernels — the indexer + sparse MLA path for glm_moe_dsa / deepseek_v3.2.
+_CUSTOM_ATTN_IMPLEMENTATIONS = {"te", "sdpa", "flex", "tilelang"}
 _ALL_ATTN_IMPLEMENTATIONS = _HF_ATTN_IMPLEMENTATIONS | _CUSTOM_ATTN_IMPLEMENTATIONS
 
 
@@ -89,12 +91,18 @@ def _resolve_custom_backend_attn(attn_implementation: str, packing_samples: bool
     if packing_samples:
         if attn_implementation == "te":
             return "te"
+        if attn_implementation == "tilelang":
+            # DSA (glm_moe_dsa / deepseek_v3.2) is THD-native: its sparse indexer
+            # *requires* qkv_format='thd', which is exactly the packed layout.
+            return "tilelang"
         if attn_implementation == "flash_attention_2":
             raise ValueError(
                 "--fsdp.packing_samples with AutoModel custom models requires --fsdp.attn_implementation te. "
                 "HF fallback packing is removed in this branch."
             )
-        raise ValueError("--fsdp.packing_samples supports only --fsdp.attn_implementation te or flash_attention_2.")
+        raise ValueError(
+            "--fsdp.packing_samples supports only --fsdp.attn_implementation te, tilelang, or flash_attention_2."
+        )
 
     if attn_implementation in _CUSTOM_ATTN_IMPLEMENTATIONS:
         return attn_implementation

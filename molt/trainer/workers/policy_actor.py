@@ -135,10 +135,11 @@ class PolicyTrainer:
             |train rank|  engine-0  |  engine-1  |   engine-2   |
 
         One rank per vLLM worker GPU, so an engine occupies
-        `tensor_parallel_size` consecutive ranks; a TP group spanning 2 nodes
-        still contributes one rank per GPU. The packed broadcast reaches every
-        worker; each loads only the shards/experts it owns. FSDP2/TP params are
-        materialized before broadcasting.
+        `tensor_parallel_size * pipeline_parallel_size` consecutive ranks; a
+        TP/PP group spanning nodes still contributes one rank per GPU. The packed
+        broadcast reaches every worker; each loads only the shards/experts/PP-stage
+        layers it owns (vLLM's name-based load_weights skips the rest). FSDP2/TP
+        params are materialized before broadcasting.
         """
         master_address = ray._private.services.get_node_ip_address()
         with socket.socket() as sock:
@@ -147,14 +148,16 @@ class PolicyTrainer:
 
         vllm_num_engines = self.strategy.args.vllm.num_engines
         vllm_tensor_parallel_size = self.strategy.args.vllm.tensor_parallel_size
-        world_size = vllm_num_engines * vllm_tensor_parallel_size + 1
+        vllm_pipeline_parallel_size = getattr(self.strategy.args.vllm, "pipeline_parallel_size", 1)
+        engine_world = vllm_tensor_parallel_size * vllm_pipeline_parallel_size
+        world_size = vllm_num_engines * engine_world + 1
 
         group_name = "molt"
         refs = [
             engine.init_process_group.remote(
                 master_address,
                 master_port,
-                i * vllm_tensor_parallel_size + 1,
+                i * engine_world + 1,
                 world_size,
                 group_name,
                 backend=backend,

@@ -98,6 +98,7 @@ def train(args):
             block_size=args.vllm.block_size,
             mtp_num_speculative_tokens=args.vllm.mtp_num_speculative_tokens,
             enable_return_routed_experts=args.train.routing_replay,
+            pipeline_parallel_size=getattr(args.vllm, "pipeline_parallel_size", 1),
         )
 
     # init actor / reference / critic models
@@ -124,12 +125,13 @@ def train(args):
             + (actor_gpus if has_critic else 0)
         )
     )
-    vllm_gpus = args.vllm.num_engines * args.vllm.tensor_parallel_size
+    vllm_pp = getattr(args.vllm, "pipeline_parallel_size", 1)
+    vllm_gpus = args.vllm.num_engines * args.vllm.tensor_parallel_size * vllm_pp
     total_gpus = int(ray.cluster_resources().get("GPU", 0))
     if total_gpus and model_gpus + vllm_gpus > total_gpus:
         raise RuntimeError(
             f"GPU over-subscription: FSDP models need {model_gpus} GPUs + vLLM "
-            f"({args.vllm.num_engines} engines x TP{args.vllm.tensor_parallel_size}) = {vllm_gpus} GPUs = "
+            f"({args.vllm.num_engines} engines x TP{args.vllm.tensor_parallel_size} x PP{vllm_pp}) = {vllm_gpus} GPUs = "
             f"{model_gpus + vllm_gpus} > {total_gpus} cluster GPUs. Lower --vllm.num_engines or add nodes. "
             f"(Otherwise placement deadlocks forever.)"
         )
@@ -472,6 +474,15 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="tensor parallel size of vLLM Engine for multi-GPU inference",
+    )
+    parser.add_argument(
+        "--vllm.pipeline_parallel_size",
+        type=int,
+        default=1,
+        help="pipeline parallel size per vLLM engine. For a giant MoE that overflows a "
+        "node, set TP to the node GPU count and PP to the node span (TP*PP GPUs/engine, "
+        "ray executor): PP hands off between stages point-to-point across nodes instead "
+        "of a cross-node TP all-reduce every layer.",
     )
     parser.add_argument("--vllm.sync_backend", type=str, default="nccl", help="trainer -> vLLM weight sync backend")
     parser.add_argument("--vllm.enforce_eager", action="store_true", default=False, help="Disable CUDA graph in vLLM")
@@ -867,8 +878,11 @@ if __name__ == "__main__":
 
     if args.fsdp.packing_samples:
         assert args.vllm.num_engines > 0, "Only support `--fsdp.packing_samples` with vLLM."
-        if args.fsdp.attn_implementation not in {"te", "flash_attention_2"}:
-            raise ValueError("--fsdp.packing_samples requires --fsdp.attn_implementation te or flash_attention_2.")
+        # tilelang joins te/fa2: DSA (glm_moe_dsa) is THD-native and *requires* packing.
+        if args.fsdp.attn_implementation not in {"te", "flash_attention_2", "tilelang"}:
+            raise ValueError(
+                "--fsdp.packing_samples requires --fsdp.attn_implementation te, flash_attention_2, or tilelang."
+            )
 
     # --- Training / rollout sizing ---
     if args.train.dynamic_batch_enable:

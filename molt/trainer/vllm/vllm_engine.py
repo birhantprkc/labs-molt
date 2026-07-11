@@ -279,15 +279,19 @@ def create_vllm_engines(
     block_size: Optional[int] = None,
     mtp_num_speculative_tokens: int = 0,
     enable_return_routed_experts: bool = False,
+    pipeline_parallel_size: int = 1,
 ):
     """Spin up a set of vLLM Ray actors on a dedicated placement group.
 
     Async-split topology: vLLM engines run on different GPUs from the FSDP2
     actor (no GPU sharing), so we always allocate a fresh placement group.
 
-    A single engine can span nodes via TP+EP (we do not use PP): with the
-    ``ray`` executor, a ``tensor_parallel_size`` larger than one node's GPU
-    count lays out one worker per single-GPU bundle across nodes. vLLM reads
+    A single engine can span nodes via TP+EP or pipeline parallelism: with the
+    ``ray`` executor, a ``tensor_parallel_size`` (or TP*``pipeline_parallel_size``)
+    larger than one node's GPU count lays out one worker per single-GPU bundle
+    across nodes. Best practice for a giant MoE that overflows a node is
+    TP=node-size (NVLink) + PP across nodes; cross-node TP works too but pays an
+    all-reduce every layer. vLLM reads
     ``VLLM_RAY_BUNDLE_INDICES`` and sorts the bundles by node itself (see
     vllm/v1/executor/ray_executor.py); ``get_bundle_indices`` hands it a
     node-grouped slice. E.g. Kimi-class MoE on 2x8 GPUs:
@@ -306,26 +310,35 @@ def create_vllm_engines(
         )
     if distributed_executor_backend == "uni" and tensor_parallel_size != 1:
         raise ValueError("vLLM backend 'uni' only supports tensor_parallel_size=1; use 'ray' or 'mp' for TP > 1.")
-    num_gpus = tensor_parallel_size if distributed_executor_backend == "mp" else int(tensor_parallel_size == 1)
+    # Pipeline parallelism (best practice for multi-node giant-MoE serving: TP within
+    # a node over NVLink, PP across nodes with cheap point-to-point stage handoff,
+    # instead of cross-node TP all-reduce every layer). Each engine spans TP*PP GPUs.
+    # PP places layer stages on different bundles, so it needs per-worker single-GPU
+    # bundles — the ray executor, same as cross-node TP.
+    if pipeline_parallel_size > 1 and distributed_executor_backend != "ray":
+        raise ValueError("vLLM pipeline_parallel_size > 1 requires the 'ray' executor backend.")
+    engine_world = tensor_parallel_size * pipeline_parallel_size
+    num_gpus = tensor_parallel_size if distributed_executor_backend == "mp" else int(engine_world == 1)
     worker_num_gpus = _vllm_worker_num_gpus(distributed_executor_backend, num_gpus)
 
     # mp executor: one Ray actor owns `tensor_parallel_size` GPUs (vLLM spawns
     # the worker processes itself, single node only). ray executor: one
-    # single-GPU bundle per worker, so an engine's TP group can span nodes
-    # (cross-node TP+EP, e.g. Kimi-class 2x8). We don't use PP for vLLM.
+    # single-GPU bundle per worker, so an engine's TP*PP group can span nodes
+    # (cross-node TP+EP, e.g. Kimi-class 2x8, or TP-per-node + PP-across-nodes).
     if distributed_executor_backend == "mp":
         bundles = [{"GPU": tensor_parallel_size, "CPU": tensor_parallel_size} for _ in range(num_engines)]
     else:
-        bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_engines * tensor_parallel_size)]
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_engines * engine_world)]
     shared_pg = placement_group(bundles, strategy="PACK")
     ray.get(shared_pg.ready())
 
     for i in range(num_engines):
         bundle_indices = None
-        if tensor_parallel_size > 1 and distributed_executor_backend == "ray":
-            # Node-grouped slice for engine i; vLLM re-sorts by node and spans
-            # nodes when TP exceeds one node's GPU count.
-            bundle_indices = get_bundle_indices(shared_pg, i, tensor_parallel_size)
+        if engine_world > 1 and distributed_executor_backend == "ray":
+            # Node-grouped slice for engine i (TP*PP GPUs). PACK fills node-by-node,
+            # so vLLM keeps each PP stage's TP group on one node (intra-node NVLink
+            # all-reduce) and pipelines stages across nodes.
+            bundle_indices = get_bundle_indices(shared_pg, i, engine_world)
 
         scheduling_strategy = PlacementGroupSchedulingStrategy(
             placement_group=shared_pg,
@@ -338,6 +351,7 @@ def create_vllm_engines(
             "enforce_eager": enforce_eager,
             "worker_extension_cls": "molt.trainer.vllm.vllm_worker_wrap.WorkerWrap",
             "tensor_parallel_size": tensor_parallel_size,
+            "pipeline_parallel_size": pipeline_parallel_size,
             "seed": seed + i,
             "distributed_executor_backend": distributed_executor_backend,
             "max_model_len": max_model_len,

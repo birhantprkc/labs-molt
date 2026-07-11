@@ -302,7 +302,12 @@ def create_vllm_engines(
     _assert_supported_vllm()
 
     vllm_engines = []
-    distributed_executor_backend = distributed_executor_backend or ("uni" if tensor_parallel_size == 1 else "ray")
+    # Default to the ray executor whenever an engine spans more than one GPU
+    # (cross-node TP+EP or pipeline parallelism); a lone-GPU engine uses uni.
+    # Keyed on TP*PP, not TP alone, so TP=1 with PP>1 still selects ray.
+    distributed_executor_backend = distributed_executor_backend or (
+        "uni" if tensor_parallel_size * pipeline_parallel_size == 1 else "ray"
+    )
     if distributed_executor_backend not in {"uni", "ray", "mp"}:
         raise ValueError(
             "vllm.distributed_executor_backend must be one of {'uni', 'ray', 'mp'}, "

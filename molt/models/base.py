@@ -365,9 +365,10 @@ class BaseModel(nn.Module):
 
             backend_attn = _resolve_custom_backend_attn(attn_implementation, packing_samples)
             using_te = backend_attn == "te"
-            # Qwen3.5-MoE CP mixes mRoPE position tensors with local sequence
-            # shards; TE fused RoPE expects the simpler 4D rotary layout.
-            backend_cfg = {"attn": backend_attn, "rope_fusion": using_te and self.cp_size <= 1}
+            # Disable TE fused RoPE everywhere: VLM mRoPE position tensors don't match
+            # the simpler 4D rotary layout the fused kernel expects (first surfaced under
+            # Qwen3.5-MoE CP; disabled unconditionally to keep RoPE correct on all paths).
+            backend_cfg = {"attn": backend_attn, "rope_fusion": False}
             # Pin the MoE dispatcher (BackendConfig otherwise auto-selects on deep_ep
             # importability, silently changing the training path). Default hybridep to
             # match AutoModel; == deepep on intra-node NVLink. Override MOLT_MOE_DISPATCHER

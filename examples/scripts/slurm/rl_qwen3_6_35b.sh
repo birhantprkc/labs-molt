@@ -193,6 +193,10 @@ MAX_IMAGES_PER_PROMPT="${MAX_IMAGES_PER_PROMPT:-1}"
 # vLLM rollout side: dedicated full node, TP+EP hybrid for MoE.
 VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-1}"
 VLLM_TP_SIZE="${VLLM_TP_SIZE:-8}"
+# Rollout data parallelism. vLLM has no standalone EP size (EP = TP * DP), so set
+# DP>1 to decouple EP from TP (e.g. TP4 + DP2 -> EP8 on one 8-GPU node). DP>1
+# requires the ray executor. Default 1 = unchanged.
+VLLM_DP_SIZE="${VLLM_DP_SIZE:-1}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 VLLM_MM_ENCODER_ATTN_BACKEND="${VLLM_MM_ENCODER_ATTN_BACKEND:-TORCH_SDPA}"
 VLLM_GDN_PREFILL_BACKEND="${VLLM_GDN_PREFILL_BACKEND:-triton}"
@@ -392,6 +396,7 @@ RL_ARGS=(
   --ref.num_gpus_per_node "$ACTOR_GPUS_PER_NODE"
   --vllm.num_engines "$VLLM_NUM_ENGINES"
   --vllm.tensor_parallel_size "$VLLM_TP_SIZE"
+  --vllm.data_parallel_size "$VLLM_DP_SIZE"
   --vllm.sync_backend nccl
   --vllm.gpu_memory_utilization "$VLLM_GPU_MEMORY_UTILIZATION"
   --vllm.mm_encoder_attn_backend "$VLLM_MM_ENCODER_ATTN_BACKEND"

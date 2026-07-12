@@ -302,17 +302,22 @@ def create_vllm_engines(
 
     vLLM has no standalone expert-parallel size: ``EP = TP * DP``. To decouple EP
     from TP (DeepSeek-V3-style TP8 attention + EP32 experts) raise
-    ``data_parallel_size``; vLLM's ray DP backend places one TP*PP replica per
-    node-grouped bundle slice, so an engine then spans ``TP * PP * DP`` GPUs.
+    ``data_parallel_size``; the engine's one actor then owns ``TP * DP`` GPUs and
+    vLLM spawns the DP replicas as local subprocesses (mp, single node).
     """
     _assert_supported_vllm()
 
     vllm_engines = []
-    # Default to the ray executor whenever an engine spans more than one GPU
-    # (cross-node TP+EP, pipeline, or data parallelism); a lone-GPU engine uses
-    # uni. Keyed on TP*PP*DP, so TP=1 with PP>1 or DP>1 still selects ray.
+    # Backend default: a lone-GPU engine uses uni. Data parallelism uses mp so
+    # vLLM spawns the DP replicas as local subprocesses (single node) — the ray
+    # DP backend instead allocates its own placement groups and collides with the
+    # one we pre-create below. Everything else (cross-node TP+EP, pipeline) uses ray.
     distributed_executor_backend = distributed_executor_backend or (
-        "uni" if tensor_parallel_size * pipeline_parallel_size * data_parallel_size == 1 else "ray"
+        "uni"
+        if tensor_parallel_size * pipeline_parallel_size * data_parallel_size == 1
+        else "mp"
+        if data_parallel_size > 1
+        else "ray"
     )
     if distributed_executor_backend not in {"uni", "ray", "mp"}:
         raise ValueError(
@@ -329,20 +334,31 @@ def create_vllm_engines(
     if pipeline_parallel_size > 1 and distributed_executor_backend != "ray":
         raise ValueError("vLLM pipeline_parallel_size > 1 requires the 'ray' executor backend.")
     # Data parallelism is how a rollout engine gets EP > TP (vLLM defines
-    # EP = TP * DP). vLLM's ray DP backend lays one TP*PP replica per node-grouped
-    # bundle slice, so DP (like PP) needs the ray executor and single-GPU bundles.
-    if data_parallel_size > 1 and distributed_executor_backend != "ray":
-        raise ValueError("vLLM data_parallel_size > 1 requires the 'ray' executor backend.")
+    # EP = TP * DP). One actor owns the engine's TP*DP GPUs and vLLM spawns the DP
+    # replicas as local subprocesses (mp), so DP is single-node: the ray DP backend
+    # builds its own placement groups and collides with the one we pre-create.
+    if data_parallel_size > 1 and distributed_executor_backend != "mp":
+        raise ValueError(
+            "vLLM data_parallel_size > 1 requires the 'mp' executor (single-node); the ray "
+            "DP backend allocates its own placement groups and collides with molt's."
+        )
+    if data_parallel_size > 1 and pipeline_parallel_size > 1:
+        raise ValueError(
+            "vLLM data_parallel_size > 1 (single-node mp) cannot combine with pipeline_parallel_size > 1."
+        )
     engine_world = tensor_parallel_size * pipeline_parallel_size * data_parallel_size
-    num_gpus = tensor_parallel_size if distributed_executor_backend == "mp" else int(engine_world == 1)
+    num_gpus = (
+        tensor_parallel_size * data_parallel_size if distributed_executor_backend == "mp" else int(engine_world == 1)
+    )
     worker_num_gpus = _vllm_worker_num_gpus(distributed_executor_backend, num_gpus)
 
-    # mp executor: one Ray actor owns `tensor_parallel_size` GPUs (vLLM spawns
-    # the worker processes itself, single node only). ray executor: one
-    # single-GPU bundle per worker, so an engine's TP*PP group can span nodes
-    # (cross-node TP+EP, e.g. Kimi-class 2x8, or TP-per-node + PP-across-nodes).
+    # mp executor: one Ray actor owns `tensor_parallel_size * data_parallel_size`
+    # GPUs (vLLM spawns the worker/DP-replica processes itself, single node only).
+    # ray executor: one single-GPU bundle per worker, so an engine's TP*PP group
+    # can span nodes (cross-node TP+EP, e.g. Kimi-class 2x8, or TP-per-node + PP).
     if distributed_executor_backend == "mp":
-        bundles = [{"GPU": tensor_parallel_size, "CPU": tensor_parallel_size} for _ in range(num_engines)]
+        gpus_per_engine = tensor_parallel_size * data_parallel_size
+        bundles = [{"GPU": gpus_per_engine, "CPU": gpus_per_engine} for _ in range(num_engines)]
     else:
         bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_engines * engine_world)]
     shared_pg = placement_group(bundles, strategy="PACK")
@@ -443,10 +459,10 @@ def create_vllm_engines(
         if data_parallel_size > 1:
             # vLLM EP = TP * DP: raising DP is the only way a rollout engine gets
             # more expert-parallel groups than its TP degree (DeepSeek-V3-style
-            # TP8+DP4 -> EP32). The ray DP backend places one TP*PP replica per
-            # node-grouped bundle slice, matching the placement group above.
+            # TP8+DP4 -> EP32). The mp DP backend spawns the replicas as local
+            # subprocesses across this actor's TP*DP GPUs (single node).
             actor_kwargs["data_parallel_size"] = data_parallel_size
-            actor_kwargs["data_parallel_backend"] = "ray"
+            actor_kwargs["data_parallel_backend"] = "mp"
 
         if enable_return_routed_experts:
             # R3: make vLLM return the router's per-token top-k expert ids so the

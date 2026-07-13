@@ -192,12 +192,12 @@ The named schemes and their prior art:
 | `level token mode trunc` | truncated IS | TIS |
 | `level token mode mask` | token masking | IcePop |
 | `level token mode clip` | token clip | per-token weight clamp |
-| `level geo mode mask` | seq-mask-tis (recipe default) | GSPO-style sequence ratio used as a filter |
+| `level geo mode mask` | seq-mask-tis (recipe default) | MIS-style sequence masked importance sampling |
 | `level seq mode mask` | product-ratio reject | sequence log-ratio sum |
 
 References: **TIS** (truncated importance sampling of the train/infer ratio), **IcePop**
-(token-level masking of out-of-band ratios), and **GSPO** (Qwen — sequence-level importance
-ratio, which motivates the `seq`/`geo` aggregation).
+(token-level masking of out-of-band ratios), and **MIS** (masked importance sampling, Yingru Li —
+sequence-level masked IS, which motivates the `seq`/`geo` rejection filter).
 
 ## 📦 Installation
 

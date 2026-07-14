@@ -674,18 +674,16 @@ class GenerateSamplesActor:
                     self._last_eval_step = global_step
                     self._next_eval_step = (global_step // eval_steps + 1) * eval_steps
                     logger.info(f"Starting async evaluation at step {global_step}...")
-                    # Independent eval sampling: any knob left unset (None) falls back to the
+                    # Independent eval sampling: each knob left unset (None) falls back to the
                     # rollout value in generate_kwargs; override only what's set for eval.
                     eval_n = self.args.eval.n_samples_per_prompt
                     if eval_n is None:
                         eval_n = self.args.rollout.n_samples_per_prompt
                     eval_kwargs = {**self.generate_kwargs, "n_samples_per_prompt": eval_n}
-                    if self.args.eval.temperature is not None:
-                        eval_kwargs["temperature"] = self.args.eval.temperature
-                    if self.args.eval.top_p is not None:
-                        eval_kwargs["top_p"] = self.args.eval.top_p
-                    if self.args.eval.max_new_tokens is not None:
-                        eval_kwargs["max_new_tokens"] = self.args.eval.max_new_tokens
+                    for key in ("temperature", "top_p", "max_new_tokens"):
+                        override = getattr(self.args.eval, key)
+                        if override is not None:
+                            eval_kwargs[key] = override
                     # Under partial rollout the rollout path (below) deliberately
                     # skips vllm_lock so the trainer's broadcast_to_vllm refit can
                     # interleave via pause/resume. Eval must follow the same

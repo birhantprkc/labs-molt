@@ -332,6 +332,56 @@ def test_run_turn_vlm_carries_pixel_values(monkeypatch):
     assert tp.calls[0][1] == {"image": ["PIL"]}  # images forwarded to generate as multi_modal_data
 
 
+def test_multiturn_vlm_carries_image_and_absorbs_a_new_one(monkeypatch):
+    # The two multi-turn VLM cases geo3k (image only in turn 1) does NOT exercise: (1) turn 1's image
+    # must PERSIST across a later text turn — pixel_values/budget kept, generation still gets mm_data;
+    # (2) a turn that adds a NEW image must accumulate it into the same trajectory (the delta path).
+    monkeypatch.setattr(cs, "load_images", lambda url: ["PIL1"])
+    monkeypatch.setattr(cs, "estimate_vllm_input_expansion_delta", lambda *a, **k: 5)
+    monkeypatch.setattr(
+        cs,
+        "_tokenize_observation",
+        lambda proc, text, imgs: ([1, 2, 3], {"pixel_values": np.ones((1, 3, 4, 4))}, list(imgs)),
+    )
+
+    def fake_feedback(proc, text, new_images, traj, max_len):
+        if new_images:  # mirror the real _tokenize_feedback: accumulate the new image in place
+            traj.pil_images.extend(new_images)
+            traj.mm_train_inputs = {"pixel_values": np.ones((len(traj.pil_images), 3, 4, 4))}
+            traj.image_budget += 5
+            return [60, 61]
+        return [50, 51]  # text-only delta
+
+    monkeypatch.setattr(cs, "_tokenize_feedback", fake_feedback)
+    state, tp = _state([_act([90], [-0.1]), _act([91], [-0.2]), _act([92], [-0.3])])
+    state.open("sid", "P", "lab", None)
+    session = state.sessions["sid"]
+
+    img = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u"}}]}]
+    _drive(state, session, img)  # turn 1: the image
+    traj = session.trajectories[0]
+    assert traj.pil_images == ["PIL1"] and tp.calls[0][1] == {"image": ["PIL1"]}
+
+    # turn 2: a TEXT tool response -> the image must NOT be dropped and must still reach generation
+    msgs = img + [{"role": "assistant", "content": "ACT"}, {"role": "user", "content": "obs"}]
+    _drive(state, session, msgs)
+    assert len(session.trajectories) == 1 and traj.pil_images == ["PIL1"]  # same segment, image kept
+    assert tp.calls[1][1] == {"image": ["PIL1"]}
+
+    # turn 3: a NEW image mid-conversation -> accumulated into the one trajectory (both forwarded)
+    monkeypatch.setattr(cs, "load_images", lambda url: ["PIL2"])
+    msgs = msgs + [
+        {"role": "assistant", "content": "ACT"},
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u2"}}]},
+    ]
+    _drive(state, session, msgs)
+    assert traj.pil_images == ["PIL1", "PIL2"] and traj.mm_train_inputs["pixel_values"].shape[0] == 2
+    assert traj.image_budget == 10 and tp.calls[2][1] == {"image": ["PIL1", "PIL2"]}
+    # token-exact across all 3 turns (image prompt + action + text delta + action + image delta + action)
+    assert traj.observation_tokens == [1, 2, 3, 90, 50, 51, 91, 60, 61, 92]
+    assert traj.action_ranges == [(3, 4), (6, 7), (9, 10)]
+
+
 def test_run_turn_absorbs_unified_routing_by_position(monkeypatch):
     _patch_prompts(monkeypatch, [[1, 2, 3]])
     routed = [[10], [11], [12], [20], [21]]  # unified [tokens,layer,topk]: 3 prompt + 2 action rows

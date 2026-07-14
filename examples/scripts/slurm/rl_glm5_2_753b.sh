@@ -17,7 +17,7 @@
 #SBATCH --account=your_slurm_account
 #SBATCH --partition=interactive
 #SBATCH --time=04:00:00
-#SBATCH --nodes=20
+#SBATCH --nodes=36
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=4
 #SBATCH --job-name=molt-vrl-glm5-2
@@ -33,29 +33,29 @@ export MOLT_PATH="$REPO_ROOT"
 
 # GLM-5.2 (model_type=glm_moe_dsa, GlmMoeDsaForCausalLM): ~750B MLA+DSA MoE
 # (DeepSeek-V3.2-style sparse attention). 78 layers, 256 routed experts, MTP 1.
-# AutoModel custom MoE asserts TP=1. 20-node split: 16 actor/ref nodes (128 GPUs,
-# EP128) + 4 vLLM rollout nodes (32 GPUs). Backend values mirror AutoModel's
-# verified recipe examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml.
+# AutoModel custom MoE asserts TP=1. 36-node split: 32 actor/ref nodes (256 GPUs,
+# EP256) + 4 vLLM rollout nodes (32 GPUs). GLM-5.2 does not support context
+# parallelism here, so CP=1 (no tilelang-CP activation sharding).
 export MODEL_PATH="${MODEL_PATH:-/path/to/models/GLM-5.2}"
-# TP MUST be 1 (custom MoE parallelizer). EP=128 = full non-PP world (dp16*cp8*tp1=128);
-# 256 experts / 128 = 2 experts/rank (256 % 128 == 0).
+# TP MUST be 1 (custom MoE parallelizer). EP=256 = full non-PP world (dp256*cp1*tp1=256);
+# 256 experts / 256 = 1 expert/rank.
 export TP_SIZE="${TP_SIZE:-1}"
-export EP_SIZE="${EP_SIZE:-128}"
+export EP_SIZE="${EP_SIZE:-256}"
 # Activation checkpointing ON (safe under the hybridep MoE dispatcher; deterministic
 # recompute).
 export GRAD_CHECKPOINT="${GRAD_CHECKPOINT-full}"
-# CP=8 (AutoModel's verified GLM-5.2 CP degree; DSA/MLA tilelang CP path).
-#  * dp = world 128 / cp8 = 16, so train.batch_size must be >= dp=16 (see below).
-#  * cp is the innermost mesh axis, so cp8 = 8 ranks = 1 node (intra-node NVLink).
-#  * GLM is MLA (no GDN), so no linear-attn full-seq all-gather concern.
-export CP_SIZE="${CP_SIZE:-8}"
-# 16K context for the smoke. CP=8 shards activations to 16384/8=2048 tok/rank.
+# CP=1: GLM-5.2 does not support context parallelism here (no tilelang-CP path).
+#  * dp = world 256 / cp1 = 256, so train.batch_size must be >= dp=256 (see below).
+#  * Without CP the 16K activations are NOT sharded per rank; memory relies on
+#    activation checkpointing + adam offload and is UNTESTED at this scale —
+#    lower MAX_LENGTH if it OOMs.
+export CP_SIZE="${CP_SIZE:-1}"
 export MAX_LENGTH="${MAX_LENGTH:-16384}"
 # Adam optimizer offload (fp32 master + Adam moments on CPU during the step).
-# Essential to fit a 397B optimizer state off-GPU on 64 GPUs without PP.
+# Essential to fit the ~750B optimizer state off-GPU without PP.
 export OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-1}"
-# FSDP param CPU offload OFF (Qwen3.5-MoE has upstream device-mismatch bugs under
-# full offload). Control GPU memory via EP + CP + adam-offload + AC.
+# FSDP param CPU offload OFF (full param offload hits upstream device-mismatch bugs
+# on these custom-MoE models). Control GPU memory via EP + adam-offload + AC.
 export FSDP_CPU_OFFLOAD="${FSDP_CPU_OFFLOAD:-0}"
 
 # GLM-5.2 is a TEXT model (GlmMoeDsaForCausalLM, no vision) — no visual encoder.
@@ -74,10 +74,11 @@ export MOLT_MOE_DISPATCHER="${MOLT_MOE_DISPATCHER:-torch}"
 # 50-step stability/correctness smoke. max_steps =
 # len(dataset)//rollout_batch * num_episodes = 50//1 * 1 = 50.
 export LR="${LR:-2e-6}"
-export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
-export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2}"
+# dp=256 (cp1), so train.batch_size must be >= 256 = rollout_batch 32 x n_samples 8.
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
+export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-32}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
-export MAX_SAMPLES="${MAX_SAMPLES:-50}"
+export MAX_SAMPLES="${MAX_SAMPLES:-1600}"
 export NUM_EPISODES="${NUM_EPISODES:-1}"
 export ASYNC_QUEUE_SIZE="${ASYNC_QUEUE_SIZE:-1}"
 # R3 rollout routing replay ON (automodel-r3 PR#2797 + molt --train.routing_replay).
@@ -85,7 +86,7 @@ export ROUTING_REPLAY="${ROUTING_REPLAY:-1}"
 # Chat agent (loopback OpenAI SDK harness), NOT the STEP runner.
 # Text math Env agent (GLM-5.2 is text-only; the VLM chat_geo3k agent does not apply).
 export AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/math.py}"
-# 50-step smoke: don't persist a 397B checkpoint (skip intermediate + final saves).
+# Bounded run: don't persist a ~750B checkpoint (skip intermediate + final saves).
 export SAVE_STEPS="${SAVE_STEPS:-1000}"
 export DISABLE_FINAL_SAVE="${DISABLE_FINAL_SAVE:-1}"
 # Sparse pass@1 eval so the 50-step run isn't dominated by eval rollouts.
@@ -95,9 +96,9 @@ export EVAL_N_SAMPLES_PER_PROMPT="${EVAL_N_SAMPLES_PER_PROMPT:-1}"
 export ENABLE_DYNAMIC_FILTERING="${ENABLE_DYNAMIC_FILTERING:-0}"
 # Per-turn generation cap (the multi-turn chat agent accumulates within MAX_LENGTH).
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
-# Actor/ref: 16 dedicated training nodes (128 GPUs, EP128) — 2x the 397B to fit
-# the ~750B fp32-faithful refit gather (packed-expert full_tensor spike).
-export ACTOR_NODES="${ACTOR_NODES:-16}"
+# Actor/ref: 32 dedicated training nodes (256 GPUs, EP256) for the ~750B model
+# (the fp32-faithful refit gather has a packed-expert full_tensor spike).
+export ACTOR_NODES="${ACTOR_NODES:-32}"
 # vLLM rollout on the other 4 nodes (32 GPUs). MoE-standard layout: 1 engine at
 # TP=32 with expert parallelism (enable_expert_parallel makes EP = TP = 32), so the
 # ~720B of experts shard EP32 (~45 GB/GPU) and MLA attention shards TP32. This is the
@@ -110,9 +111,9 @@ export VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-r
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 
 # Stable SAVE_ROOT (no $SLURM_JOB_ID) so resubmits can resume via LOAD_ENABLE=1.
-export SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/async-visual-rl-glm5-2/run}"
-export WANDB_PROJECT="${WANDB_PROJECT:-molt_visual_rl_glm5_2}"
-export WANDB_RUN_NAME="${WANDB_RUN_NAME:-glm5_2_visual_$SLURM_JOB_ID}"
+export SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/async-rl-glm5-2/run}"
+export WANDB_PROJECT="${WANDB_PROJECT:-molt_rl_glm5_2}"
+export WANDB_RUN_NAME="${WANDB_RUN_NAME:-glm5_2_$SLURM_JOB_ID}"
 
 # Idle-reaper exemption: async RL idles the actor GPUs during eval@0 and between
 # train steps, so without this the idle-GPU reaper kills the job. Pass the same

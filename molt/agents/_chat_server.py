@@ -354,7 +354,11 @@ def _merge_prefix_steps(steps: list) -> list:
         if step.routed_experts is not None:  # copy the turn's routing onto the appended [n:] positions
             if cur.routed_experts is None:
                 cur.routed_experts = [None] * len(cur.observation_tokens)
-            for i in range(n, min(len(cur.observation_tokens), len(step.routed_experts))):
+            # Start at n-1, not n: the previous turn's trailing sampled token (index n-1) had
+            # no routing at sampling time (None), but this turn's prefill captured it, so
+            # backfill that one boundary position too. The `is None` guard only fills, never
+            # overwrites, so already-set rows are untouched.
+            for i in range(max(0, n - 1), min(len(cur.observation_tokens), len(step.routed_experts))):
                 if cur.routed_experts[i] is None:
                     cur.routed_experts[i] = step.routed_experts[i]
         cur.truncated = cur.truncated or step.truncated

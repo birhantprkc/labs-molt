@@ -223,12 +223,12 @@ class RolloutRayActor:
         )
         return result
 
-    async def reset_refit_audit(self):
-        await self.llm.collective_rpc("reset_refit_audit")
+    async def reset_weight_update_check(self):
+        await self.llm.collective_rpc("reset_weight_update_check")
 
-    async def refit_audit_missing(self):
+    async def weight_update_missing(self):
         # Union the per-worker missing-param lists (weights are TP/EP-sharded across workers).
-        results = await self.llm.collective_rpc("refit_audit_missing")
+        results = await self.llm.collective_rpc("weight_update_missing")
         missing = set()
         for r in results or []:
             missing.update(r or [])

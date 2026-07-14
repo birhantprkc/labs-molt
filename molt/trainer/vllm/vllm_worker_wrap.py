@@ -75,9 +75,10 @@ class WorkerWrap:
         ]
         loaded = self.model_runner.model.load_weights(weights=weights)
         # Accumulate refreshed param names for the optional whole-broadcast coverage
-        # audit (--train.audit_refit); a no-op unless reset_refit_audit() armed it.
-        if getattr(self, "_refit_audit_loaded", None) is not None and loaded:
-            self._refit_audit_loaded.update(loaded)
+        # check (--train.check_weight_update_equal); a no-op unless armed via
+        # reset_weight_update_check().
+        if getattr(self, "_weight_update_loaded", None) is not None and loaded:
+            self._weight_update_loaded.update(loaded)
         # Warn on EVERY refit flush that vLLM ignored entirely (loaded nothing) -- a real
         # name-format break silently drops those updates -> stale rollout weights.
         # `load_weights` returns the set of *vLLM-internal* param names it assigned, which
@@ -95,16 +96,16 @@ class WorkerWrap:
             )
         del buf
 
-    def reset_refit_audit(self):
+    def reset_weight_update_check(self):
         """Begin tracking which params load_weights assigns across this refit's flushes."""
-        self._refit_audit_loaded = set()
+        self._weight_update_loaded = set()
 
-    def refit_audit_missing(self):
+    def weight_update_missing(self):
         """This worker's float params that NO flush of the last broadcast refreshed
         (stale rollout weights), then stop tracking. Names are vLLM-internal, matching
         load_weights' return, so the set-difference is apples-to-apples."""
-        loaded = getattr(self, "_refit_audit_loaded", None)
-        self._refit_audit_loaded = None
+        loaded = getattr(self, "_weight_update_loaded", None)
+        self._weight_update_loaded = None
         if loaded is None:
             return []
         held = {n for n, p in self.model_runner.model.named_parameters() if p.is_floating_point()}

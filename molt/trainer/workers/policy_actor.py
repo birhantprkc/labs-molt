@@ -582,10 +582,10 @@ class PolicyTrainer:
         # still call `gather_full_param` (an FSDP collective) but drop the
         # gathered tensor immediately — no point staging the batch on every rank.
         is_rank0 = torch.distributed.get_rank() == 0
-        # --train.audit_refit: rank 0 arms a coverage audit, checked after the last flush.
-        audit_refit = is_rank0 and getattr(self.strategy.args.train, "audit_refit", False)
-        if audit_refit:
-            ray.get([engine.reset_refit_audit.remote() for engine in self.vllm_engines])
+        # --train.check_weight_update_equal: rank 0 arms the check, evaluated after the last flush.
+        check_weight_update = is_rank0 and getattr(self.strategy.args.train, "check_weight_update_equal", False)
+        if check_weight_update:
+            ray.get([engine.reset_weight_update_check.remote() for engine in self.vllm_engines])
         # 512 MiB flushes, matching slime's `--update-weight-buffer-size` default
         # (512 * 1024**2). vLLM runs at high gpu_memory_utilization (~0.9-0.95) with
         # little free VRAM, and the receiver allocates a contiguous
@@ -693,16 +693,16 @@ class PolicyTrainer:
         if is_rank0:
             _flush()
 
-        if audit_refit:
-            per_engine = ray.get([e.refit_audit_missing.remote() for e in self.vllm_engines])
+        if check_weight_update:
+            per_engine = ray.get([e.weight_update_missing.remote() for e in self.vllm_engines])
             missing = sorted({name for lst in per_engine for name in lst})
             if missing:
                 logger.warning(
-                    f"[audit_refit] {len(missing)} vLLM params NOT refreshed by this broadcast "
+                    f"[check_weight_update] {len(missing)} vLLM params NOT refreshed by this broadcast "
                     f"(stale rollout weights); sample: {missing[:10]}"
                 )
             else:
-                logger.info("[audit_refit] all vLLM params refreshed by this broadcast")
+                logger.info("[check_weight_update] all vLLM params refreshed by this broadcast")
 
         torch.cuda.empty_cache()
         torch_dist_barrier_and_cuda_sync()

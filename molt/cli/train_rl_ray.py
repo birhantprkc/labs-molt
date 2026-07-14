@@ -723,7 +723,7 @@ if __name__ == "__main__":
         "MoE models only; incompatible with --train.partial_rollout_enable (preemption drops routing).",
     )
     # Debug / repro: dump a rollout batch and replay it train-only (skip generation) to
-    # iterate on the training+refit path in isolation; audit_refit audits every broadcast.
+    # iterate on the training+refit path in isolation; check_weight_update_equal checks every broadcast.
     parser.add_argument(
         "--train.rollout_dump_dir",
         type=str,
@@ -737,7 +737,7 @@ if __name__ == "__main__":
         help="Load <dir>/rollout_step{N}.pt instead of generating (train-only replay).",
     )
     parser.add_argument(
-        "--train.audit_refit",
+        "--train.check_weight_update_equal",
         action="store_true",
         default=False,
         help="After each vLLM weight broadcast, warn which params vLLM did NOT refresh (stale rollout weights).",

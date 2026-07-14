@@ -172,7 +172,16 @@ class CheckpointManager:
 
     @staticmethod
     def _is_loadable_ckpt_dir(path: str) -> bool:
-        return os.path.isdir(path) and os.path.isdir(os.path.join(path, "model"))
+        # Require extra_state.pt, not just model/: it is written last (rank0, after the
+        # all-rank barrier that follows model+optim save), so its presence means the whole
+        # checkpoint finalized. Without it a preempted first checkpoint (model/ only, no
+        # `latest` marker yet) is picked by the mtime fallback and loaded as complete —
+        # partial weights resumed at step 0 with a fresh optimizer/scheduler.
+        return (
+            os.path.isdir(path)
+            and os.path.isdir(os.path.join(path, "model"))
+            and os.path.isfile(os.path.join(path, "extra_state.pt"))
+        )
 
     def _checkpoint_candidates(self, ckpt_path: str, *, include_best: bool) -> list[tuple[str, float]]:
         if not os.path.isdir(ckpt_path):

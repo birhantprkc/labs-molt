@@ -17,10 +17,10 @@
 #SBATCH --account=your_slurm_account
 #SBATCH --partition=interactive
 #SBATCH --time=04:00:00
-#SBATCH --nodes=12
+#SBATCH --nodes=20
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=4
-#SBATCH --job-name=molt-vrl-qwen35-397b
+#SBATCH --job-name=molt-vrl-glm5-2
 #SBATCH --mem=0
 #SBATCH --overcommit
 #SBATCH --exclusive
@@ -31,54 +31,51 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${MOLT_PATH:-${SLURM_SUBMIT_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}}"
 export MOLT_PATH="$REPO_ROOT"
 
-# Qwen3.5-397B-A17B (model_type=qwen3_5_moe, Qwen3_5MoeForConditionalGeneration):
-# ~397B VLM MoE, same family as Qwen3.6-35B-A3B (rl_qwen3_6_35b.sh) but far larger.
-# AutoModel's custom MoE parallelizer asserts TP=1. 12-node split: 8 actor/ref
-# nodes (64 GPUs) + 4 vLLM rollout nodes (32 GPUs). vLLM 0.23 natively serves it.
-export MODEL_PATH="${MODEL_PATH:-/path/to/models/Qwen3.5-397B-A17B}"
-# TP MUST be 1 (custom MoE parallelizer). EP=64 = full non-PP world (dp4*cp16*tp1=64);
-# 512 experts / 64 = 8 experts/rank (512 % 64 == 0).
+# GLM-5.2 (model_type=glm_moe_dsa, GlmMoeDsaForCausalLM): ~750B MLA+DSA MoE
+# (DeepSeek-V3.2-style sparse attention). 78 layers, 256 routed experts, MTP 1.
+# AutoModel custom MoE asserts TP=1. 20-node split: 16 actor/ref nodes (128 GPUs,
+# EP128) + 4 vLLM rollout nodes (32 GPUs). Backend values mirror AutoModel's
+# verified recipe examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml.
+export MODEL_PATH="${MODEL_PATH:-/path/to/models/GLM-5.2}"
+# TP MUST be 1 (custom MoE parallelizer). EP=128 = full non-PP world (dp16*cp8*tp1=128);
+# 256 experts / 128 = 2 experts/rank (256 % 128 == 0).
 export TP_SIZE="${TP_SIZE:-1}"
-export EP_SIZE="${EP_SIZE:-64}"
+export EP_SIZE="${EP_SIZE:-128}"
 # Activation checkpointing ON (safe under the hybridep MoE dispatcher; deterministic
 # recompute).
 export GRAD_CHECKPOINT="${GRAD_CHECKPOINT-full}"
-# CP=16, te-native CP path (attn=te) for this 12-node run at 32K context:
-#  * dp = world 64 / cp16 = 4, and train.batch_size=8 >= dp=4 passes the
-#    "num sample batches >= actor processes" assert (CP=1 → dp=64 would fail it).
-#  * CP=16 shards 32K to 2048 tok/rank — more activation headroom than CP=8 for the
-#    397B at 32K. cp is the innermost mesh axis, so cp16 = 16 ranks = 2 nodes: the
-#    GDN linear-attn full-seq all-gather now crosses one node boundary. If it hangs
-#    on that all-gather (as CP=32 across 4 nodes did), drop to CP=8 (intra-node/NVLink).
-#  * 2*cp=32 divides MAX_LENGTH (32768/32 = 1024).
-export CP_SIZE="${CP_SIZE:-16}"
-# 32K context. CP=16 shards non-GDN activations to 32768/16=2048 tok/rank
-# (GDN layers all-gather the full sequence).
-export MAX_LENGTH="${MAX_LENGTH:-32768}"
+# CP=8 (AutoModel's verified GLM-5.2 CP degree; DSA/MLA tilelang CP path).
+#  * dp = world 128 / cp8 = 16, so train.batch_size must be >= dp=16 (see below).
+#  * cp is the innermost mesh axis, so cp8 = 8 ranks = 1 node (intra-node NVLink).
+#  * GLM is MLA (no GDN), so no linear-attn full-seq all-gather concern.
+export CP_SIZE="${CP_SIZE:-8}"
+# 16K context for the smoke. CP=8 shards activations to 16384/8=2048 tok/rank.
+export MAX_LENGTH="${MAX_LENGTH:-16384}"
 # Adam optimizer offload (fp32 master + Adam moments on CPU during the step).
 # Essential to fit a 397B optimizer state off-GPU on 64 GPUs without PP.
 export OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-1}"
 # FSDP param CPU offload OFF (Qwen3.5-MoE has upstream device-mismatch bugs under
 # full offload). Control GPU memory via EP + CP + adam-offload + AC.
 export FSDP_CPU_OFFLOAD="${FSDP_CPU_OFFLOAD:-0}"
-# VLM+CP requires a frozen visual encoder (base.py:503).
-export FREEZE_VISUAL_ENCODER="${FREEZE_VISUAL_ENCODER:-1}"
-# Backend: attn=te enables the qwen3_5_moe CP path (see CP_SIZE); linear=torch per
-# the recipe; experts=torch_mm because grouped_gemm (gmm) isn't in molt-cu13 —
-# torch_mm uses the same GroupedExpertsDeepEP dispatcher (correct, a bit slower);
-# dispatcher=hybridep (needs deep_ep, which is in molt-cu13).
-export FSDP_ATTN_IMPLEMENTATION="${FSDP_ATTN_IMPLEMENTATION:-te}"
+
+# GLM-5.2 is a TEXT model (GlmMoeDsaForCausalLM, no vision) — no visual encoder.
+export FREEZE_VISUAL_ENCODER="${FREEZE_VISUAL_ENCODER:-0}"
+# Backend mirrors AutoModel's GLM-5.2 recipe: attn=tilelang drives the DSA
+# sparse-attention + indexer TileLang kernels (molt allows tilelang since the
+# _CUSTOM_ATTN_IMPLEMENTATIONS bump). linear=torch, experts=torch_mm (gmm absent);
+# molt already defaults rms_norm=torch_fp32, gate_precision=float32, rope_fusion=off
+# for non-te — all matching the recipe. dispatcher=torch: cross-node EP128 on this
+# fabric (hybridep/deepep internode need DOCA/IBGDA, unsupported here).
+export FSDP_ATTN_IMPLEMENTATION="${FSDP_ATTN_IMPLEMENTATION:-tilelang}"
 export MOLT_LINEAR_BACKEND="${MOLT_LINEAR_BACKEND:-torch}"
 export MOLT_MOE_EXPERTS="${MOLT_MOE_EXPERTS:-torch_mm}"
-export MOLT_MOE_DISPATCHER="${MOLT_MOE_DISPATCHER:-hybridep}"
-# Qwen3.5-MoE has GDN (gated-delta-net) linear-attention layers; vLLM needs a GDN
-# prefill backend for them.
-export VLLM_GDN_PREFILL_BACKEND="${VLLM_GDN_PREFILL_BACKEND:-triton}"
+export MOLT_MOE_DISPATCHER="${MOLT_MOE_DISPATCHER:-torch}"
+# GLM-5.2 is MLA (no GDN recurrent state) — no GDN prefill backend / mamba cache.
 # 50-step stability/correctness smoke. max_steps =
 # len(dataset)//rollout_batch * num_episodes = 50//1 * 1 = 50.
 export LR="${LR:-2e-6}"
-export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
-export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 export MAX_SAMPLES="${MAX_SAMPLES:-50}"
 export NUM_EPISODES="${NUM_EPISODES:-1}"
@@ -86,7 +83,8 @@ export ASYNC_QUEUE_SIZE="${ASYNC_QUEUE_SIZE:-1}"
 # R3 rollout routing replay ON (automodel-r3 PR#2797 + molt --train.routing_replay).
 export ROUTING_REPLAY="${ROUTING_REPLAY:-1}"
 # Chat agent (loopback OpenAI SDK harness), NOT the STEP runner.
-export AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/chat_geo3k.py}"
+# Text math Env agent (GLM-5.2 is text-only; the VLM chat_geo3k agent does not apply).
+export AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/math.py}"
 # 50-step smoke: don't persist a 397B checkpoint (skip intermediate + final saves).
 export SAVE_STEPS="${SAVE_STEPS:-1000}"
 export DISABLE_FINAL_SAVE="${DISABLE_FINAL_SAVE:-1}"
@@ -97,23 +95,24 @@ export EVAL_N_SAMPLES_PER_PROMPT="${EVAL_N_SAMPLES_PER_PROMPT:-1}"
 export ENABLE_DYNAMIC_FILTERING="${ENABLE_DYNAMIC_FILTERING:-0}"
 # Per-turn generation cap (the multi-turn chat agent accumulates within MAX_LENGTH).
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
-# Actor/ref: 8 dedicated training nodes (64 GPUs).
-export ACTOR_NODES="${ACTOR_NODES:-8}"
-# vLLM rollout on the other 4 nodes (32 GPUs). 397B bf16 (~807GB) does NOT fit 1
-# node (807/8=101GB/GPU). MoE-standard layout: 2 engines at TP=16 with expert
-# parallelism (enable_expert_parallel makes EP = TP = 16), each spanning 2 nodes, so
-# the experts shard EP16 (~50 GB/GPU). This is the verified config. (PP is available
-# via VLLM_PP_SIZE for dense models / comm-bound cases; PP for RL rollout is unproven.)
-export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-2}"
-export VLLM_TP_SIZE="${VLLM_TP_SIZE:-16}"
+# Actor/ref: 16 dedicated training nodes (128 GPUs, EP128) — 2x the 397B to fit
+# the ~750B fp32-faithful refit gather (packed-expert full_tensor spike).
+export ACTOR_NODES="${ACTOR_NODES:-16}"
+# vLLM rollout on the other 4 nodes (32 GPUs). MoE-standard layout: 1 engine at
+# TP=32 with expert parallelism (enable_expert_parallel makes EP = TP = 32), so the
+# ~720B of experts shard EP32 (~45 GB/GPU) and MLA attention shards TP32. This is the
+# vLLM DeepSeek-V3-class MoE recipe and is what the smoke served. (PP is available via
+# VLLM_PP_SIZE for dense models / comm-bound cases, but PP for RL rollout is unproven.)
+export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-1}"
+export VLLM_TP_SIZE="${VLLM_TP_SIZE:-32}"
 export VLLM_PP_SIZE="${VLLM_PP_SIZE:-1}"
 export VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-ray}"
-export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 
 # Stable SAVE_ROOT (no $SLURM_JOB_ID) so resubmits can resume via LOAD_ENABLE=1.
-export SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/async-visual-rl-qwen35-397b/run}"
-export WANDB_PROJECT="${WANDB_PROJECT:-molt_visual_rl_qwen35_397b}"
-export WANDB_RUN_NAME="${WANDB_RUN_NAME:-qwen35_397b_visual_$SLURM_JOB_ID}"
+export SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/async-visual-rl-glm5-2/run}"
+export WANDB_PROJECT="${WANDB_PROJECT:-molt_visual_rl_glm5_2}"
+export WANDB_RUN_NAME="${WANDB_RUN_NAME:-glm5_2_visual_$SLURM_JOB_ID}"
 
 # Idle-reaper exemption: async RL idles the actor GPUs during eval@0 and between
 # train steps, so without this the idle-GPU reaper kills the job. Pass the same
@@ -137,7 +136,7 @@ if [ "$CHAIN_DEPTH" -lt "$CHAIN_MAX" ]; then
     ${SLURM_JOB_RESERVATION:+--reservation="$SLURM_JOB_RESERVATION"} \
     --nodes="$SLURM_JOB_NUM_NODES" \
     --comment="$SBATCH_COMMENT" \
-    "$REPO_ROOT/examples/scripts/slurm/rl_qwen3_5_397b.sh")
+    "$REPO_ROOT/examples/scripts/slurm/rl_glm5_2.sh")
   echo "[chain] depth=$NEXT_DEPTH/$CHAIN_MAX next_jobid=$next_jobid"
 fi
 
@@ -206,11 +205,11 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 # Pure async + partial rollout: queue depth >= 2 so train overlaps next rollout.
 ASYNC_QUEUE_SIZE="${ASYNC_QUEUE_SIZE:-1}"
-MAX_IMAGES_PER_PROMPT="${MAX_IMAGES_PER_PROMPT:-1}"
-VLLM_PP_SIZE="${VLLM_PP_SIZE:-1}"
+MAX_IMAGES_PER_PROMPT="${MAX_IMAGES_PER_PROMPT:-0}"
 # vLLM rollout side: dedicated full node, TP+EP hybrid for MoE.
 VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-1}"
 VLLM_TP_SIZE="${VLLM_TP_SIZE:-8}"
+VLLM_PP_SIZE="${VLLM_PP_SIZE:-1}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.95}"
 VLLM_MM_ENCODER_ATTN_BACKEND="${VLLM_MM_ENCODER_ATTN_BACKEND:-TORCH_SDPA}"
 VLLM_GDN_PREFILL_BACKEND="${VLLM_GDN_PREFILL_BACKEND:-triton}"
@@ -479,6 +478,14 @@ fi
 
 if [ "$FREEZE_VISUAL_ENCODER" = "1" ]; then
   RL_ARGS+=(--actor.freeze_visual_encoder)
+fi
+
+# GLM-5.2 DSA REQUIRES THD/packed sequences (its sparse indexer asserts
+# qkv_format='thd'), so packing is on by default here. attn=tilelang is
+# packing-compatible (base.py _resolve_custom_backend_attn). Text-only run, so
+# molt's VLM-disables-packing guard (max_images_per_prompt>0) does not fire.
+if [ "${PACKING_SAMPLES:-1}" = "1" ]; then
+  RL_ARGS+=(--fsdp.packing_samples)
 fi
 
 if [ "$FREEZE_MOE_ROUTER" = "1" ]; then

@@ -122,6 +122,8 @@ fi
 # Use $REPO_ROOT, not $SCRIPT_DIR — Slurm copies the submitted wrapper to its
 # spool directory, so $SCRIPT_DIR points there and the launcher isn't co-located.
 # === Inlined launcher (was slurm/_launcher.sh) ===
+# Snapshot caller-wrapper positional args before `set --` clears $@.
+_FWD_ARGS=("$@")
 set --
 set -x
 
@@ -524,7 +526,7 @@ fi
 # Forward any positional args from caller wrappers — e.g. the dense
 # Qwen3-8B packing wrapper appends `--fsdp.packing_samples` to opt into
 # the FA2 THD path.
-RL_ARGS+=("$@")
+RL_ARGS+=("${_FWD_ARGS[@]+"${_FWD_ARGS[@]}"}")
 
 printf -v RL_ARGS_Q " %q" "${RL_ARGS[@]}"
 

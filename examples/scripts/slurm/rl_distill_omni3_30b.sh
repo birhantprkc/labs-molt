@@ -130,6 +130,8 @@ if [ "$CHAIN_DEPTH" -lt "$CHAIN_MAX" ]; then
 fi
 
 # === Inlined launcher ===
+# Snapshot caller-wrapper positional args before `set --` clears $@.
+_FWD_ARGS=("$@")
 set --
 set -x
 
@@ -437,7 +439,7 @@ if [ -n "${WANDB_API_KEY:-}" ]; then
   RL_ARGS+=(--logger.wandb.key "$WANDB_API_KEY")
 fi
 
-RL_ARGS+=("$@")
+RL_ARGS+=("${_FWD_ARGS[@]+"${_FWD_ARGS[@]}"}")
 
 printf -v RL_ARGS_Q " %q" "${RL_ARGS[@]}"
 

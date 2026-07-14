@@ -72,6 +72,9 @@ export WANDB_RUN_NAME="${WANDB_RUN_NAME:-qwen3_4b_packing_$SLURM_JOB_ID}"
 # === Inlined launcher (was slurm/_launcher.sh) ===
 # Packing on by default (this is the FA2 packed-path recipe); set PACKING_SAMPLES=0
 # to run the plain AutoModel path (e.g. sdpa, no cu_seq_lens) for A/B debugging.
+# Snapshot caller-wrapper positional args before `set --` clears $@ (the line below
+# then re-injects only the packing flag).
+_FWD_ARGS=("$@")
 set --
 [ "${PACKING_SAMPLES:-1}" = "1" ] && set -- --fsdp.packing_samples
 set -x
@@ -396,6 +399,8 @@ fi
 # Qwen3-4B packing wrapper appends `--fsdp.packing_samples` to opt into
 # the FA2 THD path.
 RL_ARGS+=("$@")
+# Forward the caller-wrapper positional args snapshotted before `set --`.
+RL_ARGS+=("${_FWD_ARGS[@]+"${_FWD_ARGS[@]}"}")
 
 printf -v RL_ARGS_Q " %q" "${RL_ARGS[@]}"
 

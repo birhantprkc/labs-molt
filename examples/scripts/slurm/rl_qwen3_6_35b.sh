@@ -390,7 +390,7 @@ RL_ARGS=(
   --train.max_epochs "${MAX_EPOCHS:-1}"
   --train.num_episodes "${NUM_EPISODES:-1}"
   --train.async_queue_size "$ASYNC_QUEUE_SIZE"
-  --train.colocate_fsdp_models
+  $([ "${COLOCATE:-1}" != 0 ] && echo --train.colocate_fsdp_models || true)
   $([ "${ROUTING_REPLAY:-1}" != 0 ] && echo --train.routing_replay || true)
   --actor.num_nodes "$ACTOR_NODES"
   --actor.num_gpus_per_node "$ACTOR_GPUS_PER_NODE"
@@ -425,7 +425,8 @@ RL_ARGS=(
   --actor.dual_clip "$DUAL_CLIP"
   --actor.aux_loss_coef "$MOE_AUX_LOSS_COEF"
   --actor.entropy_coef "${ENTROPY_COEF:-0.0}"
-  --algo.advantage.estimator reinforce_baseline
+  --algo.advantage.estimator "${ESTIMATOR:-reinforce_baseline}"
+  $([ "${ESTIMATOR:-reinforce_baseline}" = gae ] && echo --critic.model_name_or_path "${CRITIC_MODEL:-$MODEL_PATH}" || true)
   --algo.advantage.is_correction_level geo
   --algo.advantage.is_correction_threshold "${IS_LOW:-0.99}" "${IS_HIGH:-1.01}"
   --algo.kl.use_loss

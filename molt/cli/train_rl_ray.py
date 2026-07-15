@@ -335,6 +335,20 @@ if __name__ == "__main__":
         default=0.2,
         help="PPO value-clip range for the value loss.",
     )
+    parser.add_argument(
+        "--critic.freeze_moe_router",
+        action="store_true",
+        default=False,
+        help="Freeze the critic's MoE router/gate weights, independently of --actor.freeze_moe_router "
+        "(also inherited when the actor's flag is set).",
+    )
+    parser.add_argument(
+        "--critic.max_epochs",
+        type=int,
+        default=None,
+        help="Optimization epochs the critic runs per RL step; defaults to --train.max_epochs. Set "
+        "higher to fit the value function harder each step (a PPO critic often wants more passes).",
+    )
     # Independent critic optimizer + scheduler + grad-clip ("critic." prefix), so the
     # value model can use its own LR/optimizer (PPO critics often want a higher LR).
     add_optimizer_args(parser, prefix="critic.", default_adam_lr=5e-6)
@@ -403,10 +417,13 @@ if __name__ == "__main__":
         help="GAE lambda (PPO only). 1.0 = Monte-Carlo return minus the value baseline.",
     )
     parser.add_argument(
-        "--algo.advantage.no_std_norm",
+        "--algo.advantage.no_whiten",
         action="store_true",
         default=False,
-        help="disable dividing by std for advantages while keeping mean normalization",
+        help="skip cross-batch advantage whitening — use raw returns (no mean-center, no std). "
+        "Affects the whitening estimators (reinforce / reinforce_baseline / gae); for a no-std GRPO "
+        "use --algo.advantage.estimator dr_grpo. Useful in single-rollout / async where the batch "
+        "mean/std couple samples and are a noisy moving target.",
     )
     # Train/rollout (FSDP-actor vs vLLM) logprob-mismatch importance-sampling correction.
     parser.add_argument(

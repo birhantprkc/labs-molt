@@ -355,12 +355,12 @@ class RemoteExperienceMaker:
             sample_to_rollout=rollouts["sample_to_rollout"],
             exp_len=rollouts["exp_len"],
             action_masks=[exp.action_mask for exp in experiences],
-            no_std_norm=args.algo.advantage.no_std_norm,
             kl_coef=self.kl_ctl.value,
             gamma=args.algo.advantage.gamma,
             kls=[exp.kl for exp in experiences],
             lam=args.algo.advantage.lam,
             values=[exp.values for exp in experiences] if needs_values else None,
+            no_whiten=args.algo.advantage.no_whiten,
         )
         advantages, returns = get_advantage_estimator(self.advantage_estimator)(rewards, rollouts["groups"], ctx)
 

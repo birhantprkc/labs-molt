@@ -58,12 +58,12 @@ class AdvantageContext:
     sample_to_rollout: torch.Tensor  # (S,) maps each concat-order sample to its rollout row
     exp_len: List[int]  # samples per experience (to re-split per-sample tensors)
     action_masks: List[torch.Tensor]  # per experience (B, L)
-    no_std_norm: bool  # skip the std term when whitening
     kl_coef: float  # per-token KL reward coefficient (REINFORCE++ / GAE)
     gamma: float  # discount factor (REINFORCE++ / GAE)
     lam: float  # GAE lambda (PPO); 1.0 = Monte-Carlo return minus the value baseline
     kls: List[torch.Tensor]  # per experience (B, L) per-token KL
     values: List[torch.Tensor] | None = None  # per experience (B, L) critic V(s) at collection (PPO/gae)
+    no_whiten: bool = False  # skip whitening entirely: raw returns (no mean-center, no std)
 
 
 Estimator = Callable[
@@ -103,6 +103,8 @@ def broadcast_advantages(rollout_advantages: torch.Tensor, ctx: AdvantageContext
 
 def normalize_advantages(advantages: List[torch.Tensor], ctx: AdvantageContext) -> List[torch.Tensor]:
     """Whiten per-experience (B, L) advantages across the batch (action-mask-weighted statistics)."""
+    if ctx.no_whiten:  # raw returns as advantages — no batch mean/std coupling (single-rollout / async)
+        return advantages
     flat_adv = torch.cat([a.flatten() for a in advantages], dim=0).float()
     flat_mask = torch.cat([m.flatten() for m in ctx.action_masks], dim=0)
     num_actions = flat_mask.sum()
@@ -112,11 +114,7 @@ def normalize_advantages(advantages: List[torch.Tensor], ctx: AdvantageContext) 
         return [torch.zeros_like(a) for a in advantages]
 
     mean = (flat_adv * flat_mask).sum() / num_actions
-    if not ctx.no_std_norm:
-        rstd = (((flat_adv - mean).pow(2) * flat_mask).sum() / num_actions).clamp(min=1e-8).rsqrt()
-    else:
-        rstd = 1
-
+    rstd = (((flat_adv - mean).pow(2) * flat_mask).sum() / num_actions).clamp(min=1e-8).rsqrt()
     return [(a - mean) * rstd for a in advantages]
 
 
@@ -266,10 +264,9 @@ def gae(
     discounted return (interior values cancel by telescoping, so carry-vs-terminal is
     invisible there).
 
-    Advantages are then batch-whitened unconditionally (mean/std over action tokens,
-    std gated by ``no_std_norm``). Whitening touches only the advantages fed to the policy loss;
-    ``returns = A + V(s)`` is left un-whitened so it stays the correct value-regression
-    target for the value loss.
+    Advantages are then batch-whitened (mean/std over action tokens, unless ``no_whiten``).
+    Whitening touches only the advantages fed to the policy loss; ``returns = A + V(s)`` is left
+    un-whitened so it stays the correct value-regression target for the value loss.
     """
     if ctx.values is None:
         raise ValueError("gae requires AdvantageContext.values (advantage_estimator=gae needs a critic)")
@@ -307,8 +304,8 @@ def gae(
             adv[:, t] = running
         advantages.append(adv * mask)
         returns.append((adv + values) * mask)  # value-regression target: returns = A + V(s)
-    # Advantages must be whitened (mean/std over action tokens, std gated by
-    # no_std_norm), re-masked so off-action positions stay 0; returns are left
-    # un-whitened (they remain the value-regression target A + V(s)).
+    # Advantages must be whitened (mean/std over action tokens, unless no_whiten),
+    # re-masked so off-action positions stay 0; returns are left un-whitened (they
+    # remain the value-regression target A + V(s)).
     advantages = [a * m for a, m in zip(normalize_advantages(advantages, ctx), ctx.action_masks)]
     return advantages, returns

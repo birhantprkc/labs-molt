@@ -79,13 +79,26 @@ def _ctx(masks, kls, values, kl_coef, gamma, lam):
         sample_to_rollout=torch.arange(n),
         exp_len=[n],
         action_masks=masks,
-        no_std_norm=False,
         kl_coef=kl_coef,
         gamma=gamma,
         kls=kls,
         lam=lam,
         values=values,
     )
+
+
+def test_no_whiten_uses_raw_returns():
+    """no_whiten=True skips cross-batch whitening entirely — advantages ARE the raw returns (no
+    mean-center, no std); the default whitens to ~0 mean / ~1 std over the action tokens."""
+    adv = [torch.tensor([[1.0, 2.0, 3.0, 4.0]])]
+    masks = [torch.ones(1, 4)]
+
+    ctx_raw = _ctx(masks, [torch.zeros(1, 4)], None, 0.0, 1.0, 1.0)
+    ctx_raw.no_whiten = True
+    assert torch.equal(adv_mod.normalize_advantages(adv, ctx_raw)[0], adv[0])  # unchanged
+
+    whitened = adv_mod.normalize_advantages(adv, _ctx(masks, [torch.zeros(1, 4)], None, 0.0, 1.0, 1.0))[0]
+    assert abs(whitened.mean().item()) < 1e-5 and abs(whitened.std(unbiased=False).item() - 1.0) < 1e-4
 
 
 # gae whitens its advantages unconditionally, so the recursion is
@@ -238,7 +251,6 @@ def test_reinforce_returns_and_advantages():
         sample_to_rollout=torch.arange(2),
         exp_len=[2],
         action_masks=[mask],
-        no_std_norm=False,
         kl_coef=0.0,
         gamma=1.0,
         lam=1.0,

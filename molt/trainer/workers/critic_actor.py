@@ -75,7 +75,9 @@ class CriticTrainer:
         self.critic = critic
         self.critic_optim = critic_optim
         self.critic_scheduler = critic_scheduler
-        self.max_epochs = self.args.train.max_epochs
+        # The critic can fit the value function with more passes per RL step than the actor
+        # (--critic.max_epochs); falls back to the shared --train.max_epochs when unset.
+        self.max_epochs = getattr(self.args.critic, "max_epochs", None) or self.args.train.max_epochs
         self.value_loss_fn = ValueLoss(value_clip=self.args.critic.value_clip)
         self.replay_buffer = NaiveReplayBuffer(
             micro_train_batch_size,
@@ -268,7 +270,9 @@ class CriticModelActor(BaseModelActor):
             packing_samples=args.fsdp.packing_samples,
             temperature=args.rollout.temperature,
             freeze_visual_encoder=getattr(args.actor, "freeze_visual_encoder", False),
-            freeze_moe_router=getattr(args.actor, "freeze_moe_router", False),
+            # Critic router freeze: its own --critic.freeze_moe_router, or inherit the actor's flag.
+            freeze_moe_router=getattr(args.critic, "freeze_moe_router", False)
+            or getattr(args.actor, "freeze_moe_router", False),
             moe_aux_loss_coef=args.actor.aux_loss_coef,
         )
         strategy.print(critic)

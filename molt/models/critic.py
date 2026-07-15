@@ -107,15 +107,10 @@ class Critic(BaseModel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        hidden = _resolve_hidden_size(self.model)
-        value_head = _ValueHead(hidden)
-        # Standard PPO value-head init: std = 1 / (hidden + 1). A fresh-HF-head std
-        # (initializer_range ~0.02) is ~54x too large here (hidden=2688: 0.02 vs
-        # 1/2689=3.7e-4) and makes initial |V(s)| ~ O(1), so step-1 value_loss starts
-        # ~2 and the critic grad ~67; the small std keeps initial V(s)~0 so
-        # value_loss/grad start near zero and the critic learns from a clean baseline.
-        init_std = 1.0 / (hidden + 1)
-        nn.init.normal_(value_head.proj.weight, mean=0.0, std=init_std)
+        value_head = _ValueHead(_resolve_hidden_size(self.model))
+        # Value-head init at the model's initializer_range (HF's standard fresh-head init), so
+        # |V| ~ O(1) and the backbone learns from step 1; the pre-clip grad is bounded by --critic.max_norm.
+        nn.init.normal_(value_head.proj.weight, mean=0.0, std=getattr(self.model.config, "initializer_range", 0.02))
         device = next((p.device for p in self.model.parameters() if p.device.type != "meta"), None)
         if device is not None:
             value_head = value_head.to(device)

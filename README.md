@@ -15,7 +15,7 @@ Ray · vLLM · NVIDIA AutoModel — the smallest PyTorch-native stack for
 ![NVIDIA AutoModel](https://img.shields.io/badge/Training-NVIDIA_AutoModel-76B900?style=flat-square&logo=nvidia&logoColor=white)
 ![vLLM](https://img.shields.io/badge/Rollout-vLLM-7c3aed?style=flat-square)
 ![Ray](https://img.shields.io/badge/Runtime-Ray-028CF0?style=flat-square)
-![RL code](https://img.shields.io/badge/RL_code-~8.6K_LOC-10b981?style=flat-square)
+![RL code](https://img.shields.io/badge/RL_code-~9.2K_LOC-10b981?style=flat-square)
 [![Tech Report](https://img.shields.io/badge/Tech_Report-ResearchGate-00CCBB?style=flat-square)](https://www.researchgate.net/publication/409325071_Molt_A_Scalable_PyTorch-Native_Training_Framework_for_Agentic_Reinforcement_Learning)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/NVIDIA-NeMo/labs-molt)
 
@@ -70,7 +70,7 @@ rollout.
 | 🎯 **Single-actor simplicity** | One actor, optional KL reference — the whole RL graph fits on a page | Every gradient is explicit; every loss term is one file away |
 | 🚀 **Frontier-scale MoE** | AutoModel + FSDP2 + TP / EP / CP + Adam CPU offload, MoE-native — e.g. DeepSeek-V3 with `--fsdp.ep_size 256` | The same script that trains 8B scales to 1T-class MoE — no rewrite between scales |
 | 🔗 **Token-first contract** | Aligned token ids, logprobs, action ranges, rewards, multimodal tensors | Multi-turn, VLM, and tool-call traces share one format end-to-end |
-| 🪶 **Small, hackable surface** | ~8.6K LOC of RL code across 3 thin layers | Fork one layer without touching the others — read it in an afternoon |
+| 🪶 **Small, hackable surface** | ~9.2K LOC of RL code across 3 thin layers | Fork one layer without touching the others — read it in an afternoon |
 
 ## 📊 How It Compares
 
@@ -87,7 +87,7 @@ that still drives fully-async agentic RL at frontier MoE scale on vLLM.
 | Parallelism | **TP / EP / CP**, MoE-native | ZeRO-3 / FSDP | TP / PP / EP / SP | TP / PP / DP / CP / EP |
 | Multimodal | VLM RL, multi-turn tool calls | VLM RL (v0.10+) | Qwen2.5-VL, Kimi-VL | geo3k VLM |
 | Config surface | **CLI flags only** | CLI + scripts | Hydra + YAML | CLI + YAML |
-| RL code size¹ | **~8.6K LOC** | ~7.2K | ~62K | ~25K |
+| RL code size¹ | **~9.2K LOC** | ~7.2K | ~62K | ~25K |
 | Design center | **agentic-first research** | RLHF coverage | production breadth | Megatron throughput |
 
 **One framework, one job.** Molt is the smallest PyTorch-native
@@ -184,11 +184,14 @@ sequence-level masked IS, which motivates the `seq`/`geo` rejection filter).
 ## 📦 Installation
 
 First clone the repo — the launch scripts, agents, and recipes live here, and
-`examples/scripts/docker_run.sh` mounts this checkout into the container:
+`examples/scripts/docker_run.sh` mounts this checkout into the container. For local
+(non-container) development, add the editable install: it pulls the exact git-pinned
+AutoModel this repo is validated against, so R3 routing replay and Muon work out of the box:
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/labs-molt.git
 cd labs-molt
+pip install -e ".[vllm]"          # local development only — the container bakes everything in
 ```
 
 **The recommended path is the project container** (`dockerfile/Dockerfile`). It bakes the
@@ -197,7 +200,7 @@ NVIDIA AutoModel — built for A100 / H100 / H200 / B200·GB200, so it runs SFT 
 with no local dependency wrangling. Pull the prebuilt image from Docker Hub:
 
 ```bash
-docker pull hijkzzz/molt:latest   # or a pinned release: hijkzzz/molt:0.1.2
+docker pull hijkzzz/molt:latest   # or a pinned release: hijkzzz/molt:0.1.3
 ```
 
 ...or build it yourself from the Dockerfile (e.g. to change the CUDA / vLLM / AutoModel pins):
@@ -206,20 +209,10 @@ docker pull hijkzzz/molt:latest   # or a pinned release: hijkzzz/molt:0.1.2
 docker build -f dockerfile/Dockerfile -t hijkzzz/molt:latest .
 ```
 
-`examples/scripts/docker_run.sh` defaults to this image (build skipped), so a full-stack
-sanity check is one command:
+The released package is also on PyPI for checkout-free installs:
 
 ```bash
-bash examples/scripts/docker_run.sh "python -c 'import vllm, transformer_engine; print(vllm.__version__); print(transformer_engine.__version__)'"
-# build locally instead of pulling:  IMAGE_NAME=molt:local SKIP_BUILD=0 bash examples/scripts/docker_run.sh "pytest -q"
-```
-
-For local (non-container) development, prefer the editable install from this checkout —
-it pulls the exact git-pinned AutoModel this repo is validated against:
-
-```bash
-pip install -e ".[vllm]"         # recommended: exact git-pinned deps, R3/Muon work out of the box
-pip install "molt-rl[vllm]"      # or the released package from PyPI
+pip install "molt-rl[vllm]"
 ```
 
 > **Note**: PyPI forbids git-pinned dependencies, so `molt-rl` depends on AutoModel's PyPI
